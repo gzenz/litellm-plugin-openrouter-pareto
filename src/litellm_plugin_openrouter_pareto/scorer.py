@@ -1,0 +1,178 @@
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass
+from functools import reduce
+from itertools import groupby
+
+from .config import Rule
+from .models import EndpointEntry, StatsEndpoint
+
+OR_UPTIME_FLOOR = 95.0
+
+
+@dataclass(frozen=True, slots=True)
+class Candidate:
+    slug: str
+    tag: str
+    input_price_m: float
+    output_price_m: float
+    tps: float
+    requests: int
+    context: int
+    uptime: float
+
+
+@dataclass(frozen=True, slots=True)
+class Selection:
+    winner: Candidate | None
+    safe_set: tuple[str, ...]
+    candidates: tuple[Candidate, ...]
+    frontier: tuple[str, ...]
+
+
+_EMPTY = Selection(winner=None, safe_set=(), candidates=(), frontier=())
+
+
+@dataclass(frozen=True, slots=True)
+class _Tier:
+    price: float
+    best: Candidate
+
+
+def _uptime_by_tag(endpoints: tuple[EndpointEntry, ...]) -> Mapping[str, float]:
+    return {
+        e.tag: e.uptime_last_5m
+        for e in endpoints
+        if e.uptime_last_5m is not None
+    }
+
+
+def _to_candidate(
+    e: StatsEndpoint,
+    rule: Rule,
+    uptime_by_tag: Mapping[str, float],
+) -> Candidate | None:
+    if e.quantization is None or e.quantization not in rule.precision:
+        return None
+    if e.context_length is None or e.context_length < rule.min_context:
+        return None
+    if e.data_policy is None or e.data_policy.retains_prompts is not False:
+        return None
+    up = uptime_by_tag.get(e.provider_slug)
+    if up is None or not math.isfinite(up) or up < OR_UPTIME_FLOOR:
+        return None
+    sample = e.stats
+    if sample is None or sample.p50_throughput is None or sample.request_count is None:
+        return None
+    tps = float(sample.p50_throughput)
+    if not math.isfinite(tps) or tps <= 0:
+        return None
+    if sample.request_count < rule.min_stats_requests:
+        return None
+    pricing = e.pricing
+    if pricing is None or pricing.prompt is None or pricing.completion is None:
+        return None
+    input_price_m = float(pricing.prompt) * 1e6
+    output_price_m = float(pricing.completion) * 1e6
+    if not (math.isfinite(input_price_m) and math.isfinite(output_price_m)):
+        return None
+    if input_price_m <= 0:
+        return None
+    return Candidate(
+        slug=e.provider_slug.split("/")[0],
+        tag=e.provider_slug,
+        input_price_m=input_price_m,
+        output_price_m=output_price_m,
+        tps=tps,
+        requests=int(sample.request_count),
+        context=int(e.context_length),
+        uptime=float(up),
+    )
+
+
+def _stage1(
+    stats: tuple[StatsEndpoint, ...],
+    rule: Rule,
+    uptime_by_tag: Mapping[str, float],
+) -> tuple[Candidate, ...]:
+    return tuple(
+        c
+        for c in (_to_candidate(e, rule, uptime_by_tag) for e in stats)
+        if c is not None
+    )
+
+
+def _dedupe_by_slug(stage1: tuple[Candidate, ...]) -> tuple[Candidate, ...]:
+    ordered = sorted(stage1, key=lambda c: (c.slug, -c.tps, c.input_price_m))
+    return tuple(next(g) for _, g in groupby(ordered, key=lambda c: c.slug))
+
+
+def _add_tier(tiers: tuple[_Tier, ...], p: Candidate) -> tuple[_Tier, ...]:
+    if not tiers:
+        return (_Tier(price=p.input_price_m, best=p),)
+    current = tiers[-1]
+    if abs(p.input_price_m - current.price) / current.price > 0.01:
+        return (*tiers, _Tier(price=p.input_price_m, best=p))
+    if p.tps > current.best.tps:
+        return (*tiers[:-1], _Tier(price=current.price, best=p))
+    return tiers
+
+
+def _push_frontier(
+    acc: tuple[tuple[Candidate, ...], float],
+    tier_best: Candidate,
+) -> tuple[tuple[Candidate, ...], float]:
+    frontier, fastest = acc
+    if tier_best.tps > fastest:
+        return (*frontier, tier_best), tier_best.tps
+    return acc
+
+
+def _tier_and_frontier(
+    candidates: tuple[Candidate, ...],
+) -> tuple[tuple[Candidate, ...], tuple[str, ...]]:
+    if not candidates:
+        return (), ()
+    sorted_pts = sorted(candidates, key=lambda c: (c.input_price_m, -c.tps))
+    tiers = reduce(_add_tier, sorted_pts, ())
+    frontier, _ = reduce(_push_frontier, (t.best for t in tiers), ((), -math.inf))
+    return frontier, tuple(c.slug for c in frontier)
+
+
+def _value_walk(
+    frontier: tuple[Candidate, ...],
+    tolerance: float,
+) -> Candidate | None:
+    if not frontier:
+        return None
+
+    def advance(winner: Candidate, candidate: Candidate) -> Candidate:
+        price_increase = (candidate.input_price_m - winner.input_price_m) / winner.input_price_m
+        speed_gain = (candidate.tps - winner.tps) / winner.tps
+        return candidate if speed_gain + tolerance >= price_increase else winner
+
+    return reduce(advance, frontier[1:], frontier[0])
+
+
+def select_candidates(
+    stats_endpoints: tuple[StatsEndpoint, ...],
+    uptime_endpoints: tuple[EndpointEntry, ...],
+    rule: Rule,
+) -> Selection:
+    uptime_by_tag = _uptime_by_tag(uptime_endpoints)
+    stage1 = _stage1(stats_endpoints, rule, uptime_by_tag)
+    if not stage1:
+        return _EMPTY
+    deduped = _dedupe_by_slug(stage1)
+    frontier_candidates, frontier = _tier_and_frontier(deduped)
+    winner = _value_walk(frontier_candidates, rule.value_regression_tolerance)
+    cheapest_first = sorted(deduped, key=lambda c: (c.input_price_m, -c.tps))
+    safe_set = tuple(c.slug for c in cheapest_first)
+    return Selection(
+        winner=winner,
+        safe_set=safe_set,
+        candidates=stage1,
+        frontier=frontier,
+    )
