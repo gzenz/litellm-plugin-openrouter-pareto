@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import reduce
 from itertools import groupby
 
@@ -30,6 +30,8 @@ class Selection:
     safe_set: tuple[str, ...]
     candidates: tuple[Candidate, ...]
     frontier: tuple[str, ...]
+    excluded_bases: tuple[str, ...] = ()
+    allowed_bases: tuple[str, ...] = ()
 
 
 _EMPTY = Selection(winner=None, safe_set=(), candidates=(), frontier=())
@@ -81,7 +83,7 @@ def _to_candidate(
     if input_price_m <= 0:
         return None
     return Candidate(
-        slug=e.provider_slug.split("/")[0],
+        slug=e.provider_slug,
         tag=e.provider_slug,
         input_price_m=input_price_m,
         output_price_m=output_price_m,
@@ -92,14 +94,92 @@ def _to_candidate(
     )
 
 
+def _base_slug(slug: str) -> str:
+    return slug.split("/", 1)[0]
+
+
+def _norm_loc(value: str | None) -> str | None:
+    """A provider_info location normalized for comparison, or None when absent. Compared
+    verbatim against the operator's normalized `exclude_regions`; the plugin does not
+    judge whether the string is a real country code, only whether the two sides match."""
+    code = (value or "").strip().upper()
+    return code or None
+
+
+def _region_verdict(e: StatsEndpoint, excluded: frozenset[str]) -> str:
+    """`excluded`, `allowed`, or `unknown`. Geography is only on the stats source
+    (provider_info); the /endpoints catalogue carries neither headquarters nor
+    datacenters, so absent metadata is genuinely unknown rather than compliant.
+
+    `allowed` demands BOTH dimensions: where the provider is based and where it serves
+    from. Roughly half of OpenRouter's live rows report `headquarters` while
+    `datacenters` is null or empty, and a known headquarters says nothing about which
+    datacenters serve the request, so partial metadata is unknown rather than allowed.
+    An excluded location still wins outright: partial evidence is enough to reject,
+    never enough to approve."""
+    info = e.provider_info
+    if info is None:
+        return "unknown"
+    hq = _norm_loc(info.headquarters)
+    raw_dcs = info.datacenters
+    dcs = tuple(_norm_loc(dc) for dc in (raw_dcs or ()))
+    reported = tuple(loc for loc in (hq, *dcs) if loc is not None)
+    if any(loc in excluded for loc in reported):
+        return "excluded"
+    if hq is not None and dcs and all(dc is not None for dc in dcs):
+        return "allowed"
+    return "unknown"
+
+
+def _allowed_bases(stats: tuple[StatsEndpoint, ...], rule: Rule) -> frozenset[str]:
+    """Org bases with affirmative evidence of eligibility: every endpoint of theirs
+    that reports geography reports a non-excluded location, and (unless
+    allow_unknown_region) at least one endpoint actually reported geography. Routing
+    requires membership here, so a provider missing from telemetry is never assumed
+    allowed."""
+    if not rule.exclude_regions:
+        return frozenset()
+    excluded = frozenset(rule.exclude_regions)
+    verdicts: dict[str, set[str]] = {}
+    for e in stats:
+        verdicts.setdefault(_base_slug(e.provider_slug), set()).add(_region_verdict(e, excluded))
+    ok = {"allowed", "unknown"} if rule.allow_unknown_region else {"allowed"}
+    return frozenset(
+        base
+        for base, seen in verdicts.items()
+        if "excluded" not in seen and seen <= ok and seen
+    )
+
+
+def _excluded_bases(stats: tuple[StatsEndpoint, ...], rule: Rule) -> frozenset[str]:
+    """Org bases to drop entirely: any org with an endpoint in an excluded region,
+    plus (unless allow_unknown_region) any org whose geography cannot be determined.
+    Absence of evidence is not evidence of compliance, so unknown is ineligible by
+    default and operators opt in to the looser behavior."""
+    if not rule.exclude_regions:
+        return frozenset()
+    excluded = frozenset(rule.exclude_regions)
+    drop = {"excluded"} if rule.allow_unknown_region else {"excluded", "unknown"}
+    return frozenset(
+        _base_slug(e.provider_slug)
+        for e in stats
+        if _region_verdict(e, excluded) in drop
+    )
+
+
 def _stage1(
     stats: tuple[StatsEndpoint, ...],
     rule: Rule,
     uptime_by_tag: Mapping[str, float],
 ) -> tuple[Candidate, ...]:
+    excluded_bases = _excluded_bases(stats, rule)
     return tuple(
         c
-        for c in (_to_candidate(e, rule, uptime_by_tag) for e in stats)
+        for c in (
+            _to_candidate(e, rule, uptime_by_tag)
+            for e in stats
+            if _base_slug(e.provider_slug) not in excluded_bases
+        )
         if c is not None
     )
 
@@ -164,7 +244,11 @@ def select_candidates(
     uptime_by_tag = _uptime_by_tag(uptime_endpoints)
     stage1 = _stage1(stats_endpoints, rule, uptime_by_tag)
     if not stage1:
-        return _EMPTY
+        return replace(
+            _EMPTY,
+            excluded_bases=tuple(sorted(_excluded_bases(stats_endpoints, rule))),
+            allowed_bases=tuple(sorted(_allowed_bases(stats_endpoints, rule))),
+        )
     deduped = _dedupe_by_slug(stage1)
     frontier_candidates, frontier = _tier_and_frontier(deduped)
     winner = _value_walk(frontier_candidates, rule.value_regression_tolerance)
@@ -175,4 +259,6 @@ def select_candidates(
         safe_set=safe_set,
         candidates=stage1,
         frontier=frontier,
+        excluded_bases=tuple(sorted(_excluded_bases(stats_endpoints, rule))),
+        allowed_bases=tuple(sorted(_allowed_bases(stats_endpoints, rule))),
     )

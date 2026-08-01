@@ -43,6 +43,11 @@ class StatsSample(_ORBase):
     request_count: int | None = None
 
 
+class StatsProviderInfo(_ORBase):
+    headquarters: str | None = None
+    datacenters: list[str] | None = None
+
+
 class StatsEndpoint(_ORBase):
     provider_slug: str
     quantization: str | None = None
@@ -50,6 +55,7 @@ class StatsEndpoint(_ORBase):
     data_policy: StatsDataPolicy | None = Field(default=None, alias="data_policy")
     stats: StatsSample | None = None
     pricing: StatsPricing | None = None
+    provider_info: StatsProviderInfo | None = None
 
 
 class StatsResponse(_ORBase):

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "litellm-plugin-openrouter-pareto"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pareto-optimal OpenRouter provider chooser for LiteLLM"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,7 @@ dependencies = [
   "httpx>=0.27",
   "pydantic>=2",
   "platformdirs>=4",
+  "filelock>=3.13",
 ]
 
 [project.optional-dependencies]
@@ -31,6 +32,24 @@ test = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/litellm_plugin_openrouter_pareto"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "CLAUDE.local.md",
+  ".code-review-graph/**",
+  "dist/**",
+  "uv.lock",
+  "tests/e2e/proxy.log",
+  "tests/e2e/proxy_429.log",
+  "tests/e2e/or_pareto_config.yaml",
+  "tests/e2e/or_429_integration_config.yaml",
+  "*.tmp",
+  ".venv/**",
+  "venv/**",
+  ".pytest_cache/**",
+  ".ruff_cache/**",
+  ".pyright/**",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

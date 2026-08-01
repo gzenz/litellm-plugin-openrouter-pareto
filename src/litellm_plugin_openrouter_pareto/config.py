@@ -1,12 +1,31 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from dataclasses import dataclass
+from typing import Literal
+
+from pydantic import BaseModel, Field, TypeAdapter, field_validator
 
 
 def _coerce_str_tuple(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
     if isinstance(value, str):
         return (value,)
     return tuple(value)
+
+
+UnverifiedRegionPolicy = Literal["no_route", "unpinned", "trust_fallback"]
+_UNVERIFIED_REGION_POLICIES = frozenset({"no_route", "unpinned", "trust_fallback"})
+
+
+def _normalize_regions(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Strip, uppercase, and dedupe preserving order. Values are compared verbatim
+    against whatever OpenRouter reports in provider_info (headquarters / datacenters),
+    so an operator's `exclude_regions` and OR's field just have to agree on spelling;
+    it is not this plugin's place to police which strings are valid country codes."""
+    codes = tuple(r.strip().upper() for r in _coerce_str_tuple(value) if r.strip())
+    return tuple(dict.fromkeys(codes))
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +36,12 @@ class Rule:
     promotion_polls: int
     value_regression_tolerance: float
     cold_start_fallback: tuple[str, ...]
+    wildcard: bool = False
+    log_errors: bool = False
+    exclude_regions: tuple[str, ...] = ()
+    allow_unknown_region: bool = False
+    unverified_region_policy: UnverifiedRegionPolicy = "no_route"
+    strict_provider: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "precision", _coerce_str_tuple(self.precision))
@@ -26,6 +51,12 @@ class Rule:
             "cold_start_fallback",
             _coerce_str_tuple(self.cold_start_fallback),
         )
+        object.__setattr__(self, "exclude_regions", _normalize_regions(self.exclude_regions))
+        if self.unverified_region_policy not in _UNVERIFIED_REGION_POLICIES:
+            raise ValueError(
+                f"unverified_region_policy must be one of "
+                f"{sorted(_UNVERIFIED_REGION_POLICIES)} (got {self.unverified_region_policy!r})"
+            )
 
 
 def rule(
@@ -36,6 +67,12 @@ def rule(
     promotion_polls: int = 1,
     value_regression_tolerance: float = 0.0,
     cold_start_fallback: str | tuple[str, ...] | list[str] = (),
+    wildcard: bool = False,
+    log_errors: bool = False,
+    exclude_regions: str | tuple[str, ...] | list[str] = (),
+    allow_unknown_region: bool = False,
+    unverified_region_policy: UnverifiedRegionPolicy = "no_route",
+    strict_provider: bool = False,
 ) -> Rule:
     return Rule(
         precision=_coerce_str_tuple(precision),
@@ -44,7 +81,114 @@ def rule(
         promotion_polls=promotion_polls,
         value_regression_tolerance=value_regression_tolerance,
         cold_start_fallback=_coerce_str_tuple(cold_start_fallback),
+        wildcard=wildcard,
+        log_errors=log_errors,
+        exclude_regions=_coerce_str_tuple(exclude_regions),
+        allow_unknown_region=allow_unknown_region,
+        unverified_region_policy=unverified_region_policy,
+        strict_provider=strict_provider,
     )
+
+
+class RuleSpec(BaseModel):
+    model_config = {"extra": "forbid"}
+    precision: str | list[str] = "fp8"
+    min_context: int = Field(default=1_000_000, ge=1)
+    min_stats_requests: int = Field(default=100, ge=1)
+    promotion_polls: int = Field(default=1, ge=1)
+    value_regression_tolerance: float = Field(default=0.0, ge=0.0)
+    cold_start_fallback: list[str] = Field(default_factory=list[str])
+    wildcard: bool = False
+    log_errors: bool = False
+    exclude_regions: list[str] = Field(default_factory=list[str])
+    allow_unknown_region: bool = False
+    unverified_region_policy: UnverifiedRegionPolicy = "no_route"
+    strict_provider: bool = False
+
+    @field_validator("precision")
+    @classmethod
+    def _precision_nonempty(cls, v: str | list[str]) -> str | list[str]:
+        if isinstance(v, str):
+            if not v:
+                raise ValueError("precision must not be empty")
+        elif not v:
+            raise ValueError("precision must not be empty")
+        return v
+
+    def to_rule(self) -> Rule:
+        return rule(
+            precision=self.precision,
+            min_context=self.min_context,
+            min_stats_requests=self.min_stats_requests,
+            promotion_polls=self.promotion_polls,
+            value_regression_tolerance=self.value_regression_tolerance,
+            cold_start_fallback=self.cold_start_fallback,
+            wildcard=self.wildcard,
+            log_errors=self.log_errors,
+            exclude_regions=self.exclude_regions,
+            allow_unknown_region=self.allow_unknown_region,
+            unverified_region_policy=self.unverified_region_policy,
+            strict_provider=self.strict_provider,
+        )
+
+
+def rule_fingerprint(r: Rule) -> str:
+    """Stable digest of every field that changes candidate eligibility or winner
+    selection. A cached selection is only reusable by a process whose rule has the
+    same fingerprint, so one worker's permissive winner cannot leak into a stricter
+    worker via the shared cache file."""
+    payload = json.dumps(
+        {
+            "precision": list(r.precision),
+            "min_context": r.min_context,
+            "min_stats_requests": r.min_stats_requests,
+            "value_regression_tolerance": r.value_regression_tolerance,
+            "promotion_polls": r.promotion_polls,
+            "exclude_regions": list(r.exclude_regions),
+            "allow_unknown_region": r.allow_unknown_region,
+            "unverified_region_policy": r.unverified_region_policy,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+class RuleConfigError(ValueError):
+    pass
+
+
+_RULES_ADAPTER: TypeAdapter[dict[str, RuleSpec]] = TypeAdapter(dict[str, RuleSpec])
+
+
+def load_rules_from_settings() -> dict[str, Rule] | None:
+    import litellm
+
+    raw: object = getattr(litellm, "openrouter_pareto_rules", None)
+    source = "litellm_settings.openrouter_pareto_rules"
+    if raw is None:
+        env = os.environ.get("OPENROUTER_PARETO_RULES")
+        if env:
+            import json
+
+            try:
+                raw = json.loads(env)
+            except ValueError as exc:
+                raise RuleConfigError(
+                    f"OPENROUTER_PARETO_RULES is not valid JSON: {exc}"
+                ) from exc
+            source = "OPENROUTER_PARETO_RULES"
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not raw:
+        raise RuleConfigError(
+            f"{source} must be a non-empty mapping of model -> rule fields"
+        )
+    try:
+        specs = _RULES_ADAPTER.validate_python(raw)
+    except Exception as exc:
+        raise RuleConfigError(f"invalid {source}: {exc}") from exc
+    return {model: spec.to_rule() for model, spec in specs.items()}
 
 
 DEFAULT_RULES: dict[str, Rule] = {
@@ -54,6 +198,6 @@ DEFAULT_RULES: dict[str, Rule] = {
         min_stats_requests=100,
         promotion_polls=2,
         value_regression_tolerance=0.0,
-        cold_start_fallback=["novita"],
+        cold_start_fallback=["novita/fp8"],
     ),
 }
