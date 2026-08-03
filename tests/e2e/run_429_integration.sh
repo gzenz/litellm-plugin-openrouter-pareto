@@ -204,19 +204,28 @@ try:
     import psutil
 except ImportError:
     psutil = None
+pids = None
 if psutil is not None:
-    pids = {
-        c.pid
-        for c in psutil.net_connections(kind="tcp")
-        if c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port == int(port) and c.pid
-    }
-    print(" ".join(str(p) for p in sorted(pids)))
-else:
+    try:
+        pids = {
+            c.pid
+            for c in psutil.net_connections(kind="tcp")
+            if c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port == int(port) and c.pid
+        }
+    except psutil.AccessDenied:
+        # psutil can be importable yet denied at runtime (restricted process
+        # environments, no privilege to inspect the FDs of other processes).
+        # Fall through to the lsof path, which enumerates sockets owned by the
+        # current user without that privilege.
+        pids = None
+if pids is None:
     out = subprocess.run(
         ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
         capture_output=True, text=True,
     ).stdout
     print(" ".join(out.split()))
+else:
+    print(" ".join(str(p) for p in sorted(pids)))
 PY
 )"
 OWNED=0

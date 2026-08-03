@@ -309,6 +309,30 @@ log path: `errors.log` under the OS log directory), created owner-only (`0o600`,
 symlink following). Error bodies may contain prompt fragments; set an explicit writable
 path in production and define retention.
 
+## Telemetry SSL
+
+The telemetry client that fetches OpenRouter provider stats verifies TLS by default.
+Two global (not per-model) settings control verification, under
+`litellm_settings.openrouter_pareto_telemetry` or the `OPENROUTER_PARETO_TELEMETRY`
+JSON env var:
+
+```yaml
+litellm_settings:
+  openrouter_pareto_telemetry:
+    ssl_verify: false              # disable TLS verification (dev / self-signed proxies)
+    # ssl_ca_cert: /etc/ssl/corp-ca.pem   # trust a custom CA bundle instead
+```
+
+| Field | Default | Purpose |
+|---|---|---|
+| `ssl_verify` | `true` | `false` disables TLS verification entirely. |
+| `ssl_ca_cert` | unset | Path to a custom CA bundle; takes precedence over `ssl_verify` and requires it to stay `true`. |
+
+These only affect the telemetry fetches to `openrouter.ai`; they do not change how
+LiteLLM connects to OpenRouter for model traffic. A bad `ssl_ca_cert` path surfaces as
+a telemetry degradation warning (stale or no winner) and the plugin falls back to the
+healthy deployment set unchanged - it never raises into the request path.
+
 ## How selection works
 
 - Telemetry is cached and refreshed on a 5-minute poll. A new value-winner must win

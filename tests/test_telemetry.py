@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ssl
 import time
 from pathlib import Path
 
 import httpx
 import pytest
 
-from litellm_plugin_openrouter_pareto.config import Rule, rule
+from litellm_plugin_openrouter_pareto.config import Rule, rule, telemetry_verify
 from litellm_plugin_openrouter_pareto.models import (
     EndpointEntry,
     StatsDataPolicy,
@@ -820,3 +821,126 @@ def test_persist_keeps_a_live_entry_from_another_worker(tmp_path: Path) -> None:
 
     raw = Telemetry({}, cache_dir=tmp_path)._load_disk()
     assert len(raw) == 2, "a live cross-worker entry was pruned"
+
+
+class _SpyClient:
+    """Stand-in for httpx.AsyncClient that records the kwargs it was built with.
+    Avoids opening a real connection pool so a bad CA path cannot fail the build."""
+
+    is_closed = False
+
+    def __init__(self, **kwargs: object) -> None:
+        self.kwargs = kwargs
+
+    async def aclose(self) -> None:
+        self.is_closed = True
+
+
+def _spy_asyncclient(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, object]]:
+    """Record every httpx.AsyncClient(...) construction as a kwargs dict in order."""
+    builds: list[dict[str, object]] = []
+
+    def _build(**kwargs: object) -> _SpyClient:
+        builds.append(kwargs)
+        return _SpyClient(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _build)
+    return builds
+
+
+def test_client_defaults_to_verifying_tls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    builds = _spy_asyncclient(monkeypatch)
+    t = _telemetry(tmp_path)
+    assert t._client_or_create() is not None
+    assert builds[-1]["verify"] is True
+
+
+def test_client_passes_verify_false_when_disabled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    builds = _spy_asyncclient(monkeypatch)
+    t = Telemetry(_glm_rules(), cache_dir=tmp_path, verify=False)
+    assert t._client_or_create() is not None
+    assert builds[-1]["verify"] is False
+
+
+def test_client_passes_custom_ca_as_ssl_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A CA-bundle path is converted to an SSLContext (not the deprecated verify=<str>
+    form) before reaching httpx, so a bad path raises inside the refresh path rather
+    than at client construction."""
+    builds = _spy_asyncclient(monkeypatch)
+    sentinel = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+    def _ctx(**_kwargs: object) -> ssl.SSLContext:
+        return sentinel
+
+    monkeypatch.setattr(ssl, "create_default_context", _ctx)
+    t = Telemetry(_glm_rules(), cache_dir=tmp_path, verify="/etc/ssl/corp-ca.pem")
+    assert t._client_or_create() is not None
+    assert builds[-1]["verify"] is sentinel
+
+
+def test_ssl_verify_returns_bool_unchanged(tmp_path: Path) -> None:
+    t_false = Telemetry(_glm_rules(), cache_dir=tmp_path, verify=False)
+    assert t_false._ssl_verify() is False
+    t_true = Telemetry(_glm_rules(), cache_dir=tmp_path, verify=True)
+    assert t_true._ssl_verify() is True
+
+
+def test_ssl_verify_converts_ca_path_to_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_ctx(**kwargs: object) -> ssl.SSLContext:
+        captured.update(kwargs)
+        return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+    monkeypatch.setattr(ssl, "create_default_context", _fake_ctx)
+    t = Telemetry(_glm_rules(), cache_dir=tmp_path, verify="/some/ca.pem")
+    ctx = t._ssl_verify()
+    assert isinstance(ctx, ssl.SSLContext)
+    assert captured == {"cafile": "/some/ca.pem"}
+
+
+def test_ssl_verify_bad_path_raises(tmp_path: Path) -> None:
+    """A missing CA file raises here (inside _client_or_create, inside the refresh
+    try/except), so it degrades to a telemetry warning instead of reaching the wire."""
+    t = Telemetry(_glm_rules(), cache_dir=tmp_path, verify="/no/such/ca.pem")
+    with pytest.raises(OSError):
+        t._ssl_verify()
+
+
+def test_client_rebuilds_after_close_uses_same_verify(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    builds = _spy_asyncclient(monkeypatch)
+    t = Telemetry(_glm_rules(), cache_dir=tmp_path, verify=False)
+    t._client_or_create()
+    # A closed client is replaced on the next _client_or_create; the new build must
+    # still carry the configured verify, not silently revert to the default.
+    t._client = None
+    t._client_or_create()
+    assert len(builds) == 2
+    assert builds[1]["verify"] is False
+
+
+def test_telemetry_verify_resolution() -> None:
+    from litellm_plugin_openrouter_pareto.config import TelemetryConfig
+
+    assert telemetry_verify(None) is True
+    assert telemetry_verify(TelemetryConfig()) is True
+    assert telemetry_verify(TelemetryConfig(ssl_verify=False)) is False
+    assert telemetry_verify(TelemetryConfig(ssl_ca_cert="/x.pem")) == "/x.pem"
+    # A custom CA bundle takes precedence over the boolean default.
+    assert telemetry_verify(TelemetryConfig(ssl_verify=True, ssl_ca_cert="/x.pem")) == "/x.pem"
+
+
+def test_telemetry_config_rejects_empty_ca_cert() -> None:
+    from litellm_plugin_openrouter_pareto.config import TelemetryConfig
+
+    with pytest.raises(ValueError, match="ssl_ca_cert"):
+        TelemetryConfig(ssl_ca_cert="")
+    with pytest.raises(ValueError, match="ssl_ca_cert"):
+        TelemetryConfig(ssl_ca_cert="   ")
+
+
+def test_telemetry_config_strips_ca_cert_whitespace() -> None:
+    from litellm_plugin_openrouter_pareto.config import TelemetryConfig
+
+    cfg = TelemetryConfig(ssl_ca_cert="  /ca.pem  ")
+    assert cfg.ssl_ca_cert == "/ca.pem"

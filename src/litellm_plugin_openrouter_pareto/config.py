@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, Field, TypeAdapter, field_validator
+from pydantic import BaseModel, Field, TypeAdapter, field_validator, model_validator
 
 
 def _coerce_str_tuple(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
@@ -158,7 +158,49 @@ class RuleConfigError(ValueError):
     pass
 
 
+class TelemetryConfig(BaseModel):
+    """Global (not per-model) telemetry-client settings. Lives outside the rules
+    mapping because there is one HTTP client for all models, so SSL verification is
+    a process-wide property of the telemetry fetch, not a selection criterion."""
+
+    model_config = {"extra": "forbid"}
+    ssl_verify: bool = True
+    ssl_ca_cert: str | None = None
+
+    @field_validator("ssl_ca_cert")
+    @classmethod
+    def _ssl_ca_nonempty(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("ssl_ca_cert must be a non-empty path to a CA bundle")
+        return stripped
+
+    @model_validator(mode="after")
+    def _ssl_ca_requires_verification(self) -> TelemetryConfig:
+        if self.ssl_ca_cert is not None and not self.ssl_verify:
+            raise ValueError(
+                "ssl_ca_cert requires ssl_verify=true; a custom CA bundle is only "
+                "meaningful with verification enabled"
+            )
+        return self
+
+
+def telemetry_verify(cfg: TelemetryConfig | None) -> bool | str:
+    """Resolve a TelemetryConfig into the value httpx accepts as `verify`: True for
+    default verification, False to disable, or a CA-bundle path to use that bundle.
+    A custom CA bundle takes precedence over the boolean, since pinning a bundle is
+    a strictly stronger statement than 'verify with the system roots'."""
+    if cfg is None:
+        return True
+    if cfg.ssl_ca_cert is not None:
+        return cfg.ssl_ca_cert
+    return cfg.ssl_verify
+
+
 _RULES_ADAPTER: TypeAdapter[dict[str, RuleSpec]] = TypeAdapter(dict[str, RuleSpec])
+_TELEMETRY_ADAPTER: TypeAdapter[TelemetryConfig] = TypeAdapter(TelemetryConfig)
 
 
 def load_rules_from_settings() -> dict[str, Rule] | None:
@@ -189,6 +231,33 @@ def load_rules_from_settings() -> dict[str, Rule] | None:
     except Exception as exc:
         raise RuleConfigError(f"invalid {source}: {exc}") from exc
     return {model: spec.to_rule() for model, spec in specs.items()}
+
+
+def load_telemetry_config() -> TelemetryConfig | None:
+    import litellm
+
+    raw: object = getattr(litellm, "openrouter_pareto_telemetry", None)
+    source = "litellm_settings.openrouter_pareto_telemetry"
+    if raw is None:
+        env = os.environ.get("OPENROUTER_PARETO_TELEMETRY")
+        if env:
+            import json
+
+            try:
+                raw = json.loads(env)
+            except ValueError as exc:
+                raise RuleConfigError(
+                    f"OPENROUTER_PARETO_TELEMETRY is not valid JSON: {exc}"
+                ) from exc
+            source = "OPENROUTER_PARETO_TELEMETRY"
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise RuleConfigError(f"{source} must be a mapping of telemetry fields")
+    try:
+        return _TELEMETRY_ADAPTER.validate_python(raw)
+    except Exception as exc:
+        raise RuleConfigError(f"invalid {source}: {exc}") from exc
 
 
 DEFAULT_RULES: dict[str, Rule] = {

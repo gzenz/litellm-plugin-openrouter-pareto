@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import ssl
 import sys
 import time
 from collections.abc import Mapping
@@ -109,9 +110,11 @@ class Telemetry:
         *,
         cache_dir: str | Path | None = None,
         base_url: str = OR_BASE_URL,
+        verify: bool | str = True,
     ) -> None:
         self._rules = rules
         self._base_url = base_url.rstrip("/")
+        self._verify = verify
         dir_path = (
             Path(cache_dir)
             if cache_dir is not None
@@ -219,11 +222,25 @@ class Telemetry:
         except OSError as exc:
             self._warn("persist-io", self._cache_path.name, exc)
 
+    def _ssl_verify(self) -> bool | ssl.SSLContext:
+        """Resolve the configured verify value into what httpx accepts without the
+        deprecated `verify=<str>` form. A CA-bundle path becomes an SSLContext built
+        here (not at config-load time) so a missing or unreadable file raises inside
+        the refresh path, degrades to a warning, and never reaches the request path.
+        A directory is treated as a capath, matching httpx's own string handling."""
+        v = self._verify
+        if isinstance(v, str):
+            if os.path.isdir(v):
+                return ssl.create_default_context(capath=v)
+            return ssl.create_default_context(cafile=v)
+        return v
+
     def _client_or_create(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 headers={"User-Agent": OR_USER_AGENT},
                 timeout=OR_TIMEOUT_S,
+                verify=self._ssl_verify(),
             )
         return self._client
 

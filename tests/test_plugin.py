@@ -1612,3 +1612,245 @@ async def test_strict_mode_does_not_affect_unmanaged_models() -> None:
     request_kwargs: dict[str, Any] = {"extra_body": {"provider": {"only": ["deepinfra"]}}}
     result = await cb.async_filter_deployments("gpt-4o", [dep], None, request_kwargs)
     assert result == [dep]
+
+
+def _set_litellm_attr(name: str, value: object) -> object | None:
+    """Set a dynamic litellm attr and return the previous value (or None)."""
+    import litellm
+
+    old = getattr(litellm, name, None)
+    setattr(litellm, name, value)
+    return old
+
+
+def _restore_litellm_attr(name: str, old: object | None) -> None:
+    import litellm
+
+    if old is None:
+        if hasattr(litellm, name):
+            delattr(litellm, name)
+    else:
+        setattr(litellm, name, old)
+
+
+def test_load_telemetry_config_reads_litellm_attr() -> None:
+    from litellm_plugin_openrouter_pareto.config import load_telemetry_config
+
+    old = _set_litellm_attr("openrouter_pareto_telemetry", {"ssl_verify": False})
+    try:
+        cfg = load_telemetry_config()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_telemetry", old)
+    assert cfg is not None
+    assert cfg.ssl_verify is False
+    assert cfg.ssl_ca_cert is None
+
+
+def test_load_telemetry_config_returns_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+
+    from litellm_plugin_openrouter_pareto.config import load_telemetry_config
+
+    old = getattr(litellm, "openrouter_pareto_telemetry", None)
+    if hasattr(litellm, "openrouter_pareto_telemetry"):
+        delattr(litellm, "openrouter_pareto_telemetry")
+    monkeypatch.delenv("OPENROUTER_PARETO_TELEMETRY", raising=False)
+    try:
+        assert load_telemetry_config() is None
+    finally:
+        if old is not None:
+            setattr(  # noqa: B010  # restore
+                litellm, "openrouter_pareto_telemetry", old
+            )
+
+
+def test_load_telemetry_config_reads_env_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+
+    from litellm_plugin_openrouter_pareto.config import load_telemetry_config
+
+    old = getattr(litellm, "openrouter_pareto_telemetry", None)
+    if hasattr(litellm, "openrouter_pareto_telemetry"):
+        delattr(litellm, "openrouter_pareto_telemetry")
+    monkeypatch.setenv("OPENROUTER_PARETO_TELEMETRY", '{"ssl_ca_cert": "/ca.pem"}')
+    try:
+        cfg = load_telemetry_config()
+    finally:
+        if old is not None:
+            setattr(  # noqa: B010  # restore
+                litellm, "openrouter_pareto_telemetry", old
+            )
+    assert cfg is not None
+    assert cfg.ssl_ca_cert == "/ca.pem"
+    assert cfg.ssl_verify is True
+
+
+def test_load_telemetry_config_raises_on_unknown_field() -> None:
+    from litellm_plugin_openrouter_pareto.config import RuleConfigError, load_telemetry_config
+
+    old = _set_litellm_attr("openrouter_pareto_telemetry", {"ssl_verfy": False})
+    try:
+        with pytest.raises(RuleConfigError):
+            load_telemetry_config()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_telemetry", old)
+
+
+def test_load_telemetry_config_raises_on_non_dict() -> None:
+    from litellm_plugin_openrouter_pareto.config import RuleConfigError, load_telemetry_config
+
+    old = _set_litellm_attr("openrouter_pareto_telemetry", "not a dict")
+    try:
+        with pytest.raises(RuleConfigError):
+            load_telemetry_config()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_telemetry", old)
+
+
+def test_load_telemetry_config_raises_on_ca_with_verify_false() -> None:
+    from litellm_plugin_openrouter_pareto.config import RuleConfigError, load_telemetry_config
+
+    old = _set_litellm_attr(
+        "openrouter_pareto_telemetry", {"ssl_verify": False, "ssl_ca_cert": "/ca.pem"}
+    )
+    try:
+        with pytest.raises(RuleConfigError):
+            load_telemetry_config()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_telemetry", old)
+
+
+def test_telemetry_config_rejects_ca_with_verify_false_directly() -> None:
+    from litellm_plugin_openrouter_pareto.config import TelemetryConfig
+
+    with pytest.raises(ValueError, match="ssl_ca_cert"):
+        TelemetryConfig(ssl_verify=False, ssl_ca_cert="/ca.pem")
+
+
+async def test_plugin_threads_telemetry_verify_from_config() -> None:
+    """A telemetry SSL config (with no explicit telemetry injected) rebuilds the
+    telemetry client with the configured verify, so the operator's TLS choice
+    reaches the OpenRouter stats fetch."""
+    from litellm_plugin_openrouter_pareto.telemetry import Telemetry
+
+    old = _set_litellm_attr("openrouter_pareto_telemetry", {"ssl_verify": False})
+    try:
+        cb = OpenRouterParetoCallback()
+        cb._resolve_rules()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_telemetry", old)
+    tel = cb._telemetry
+    assert isinstance(tel, Telemetry)
+    assert tel._verify is False
+
+
+async def test_plugin_threads_custom_ca_from_config() -> None:
+    from litellm_plugin_openrouter_pareto.telemetry import Telemetry
+
+    old = _set_litellm_attr("openrouter_pareto_telemetry", {"ssl_ca_cert": "/ca.pem"})
+    try:
+        cb = OpenRouterParetoCallback()
+        cb._resolve_rules()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_telemetry", old)
+    tel = cb._telemetry
+    assert isinstance(tel, Telemetry)
+    assert tel._verify == "/ca.pem"
+
+
+async def test_plugin_keeps_default_verify_without_telemetry_config() -> None:
+    """No telemetry config and no YAML rules -> the __init__ default client (verify
+    = True) is kept, not rebuilt. Backward-compatible baseline."""
+    import litellm
+
+    from litellm_plugin_openrouter_pareto.telemetry import Telemetry
+
+    old_rules = getattr(litellm, "openrouter_pareto_rules", None)
+    old_tel = getattr(litellm, "openrouter_pareto_telemetry", None)
+    if hasattr(litellm, "openrouter_pareto_rules"):
+        delattr(litellm, "openrouter_pareto_rules")
+    if hasattr(litellm, "openrouter_pareto_telemetry"):
+        delattr(litellm, "openrouter_pareto_telemetry")
+    try:
+        cb = OpenRouterParetoCallback()
+        before = cb._telemetry
+        cb._resolve_rules()
+    finally:
+        if old_rules is not None:
+            setattr(  # noqa: B010  # restore
+                litellm, "openrouter_pareto_rules", old_rules
+            )
+        if old_tel is not None:
+            setattr(  # noqa: B010  # restore
+                litellm, "openrouter_pareto_telemetry", old_tel
+            )
+    assert cb._telemetry is before, "default client was needlessly rebuilt"
+    assert isinstance(before, Telemetry)
+    assert before._verify is True
+
+
+async def test_explicit_telemetry_survives_telemetry_config() -> None:
+    """An explicitly injected telemetry source is never replaced, even when a
+    telemetry SSL config is present (lazy resolution preserves injected deps)."""
+    stub = _StubTelemetry(None)
+    old = _set_litellm_attr("openrouter_pareto_telemetry", {"ssl_verify": False})
+    try:
+        cb = OpenRouterParetoCallback(
+            rules={"z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)},
+            telemetry=stub,
+        )
+        cb._resolve_rules()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_telemetry", old)
+    assert cb._telemetry is stub
+
+
+async def test_explicit_rules_still_apply_telemetry_verify_from_config() -> None:
+    """Global telemetry SSL config applies even when rules are supplied directly to
+    the constructor - the two config domains are independent (regression: an early
+    return on explicit rules used to skip load_telemetry_config entirely)."""
+    from litellm_plugin_openrouter_pareto.telemetry import Telemetry
+
+    old = _set_litellm_attr("openrouter_pareto_telemetry", {"ssl_verify": False})
+    try:
+        cb = OpenRouterParetoCallback(
+            rules={"z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)},
+        )
+        cb._resolve_rules()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_telemetry", old)
+    tel = cb._telemetry
+    assert isinstance(tel, Telemetry)
+    assert tel._verify is False
+
+
+async def test_explicit_rules_still_apply_custom_ca_from_config() -> None:
+    from litellm_plugin_openrouter_pareto.telemetry import Telemetry
+
+    old = _set_litellm_attr("openrouter_pareto_telemetry", {"ssl_ca_cert": "/ca.pem"})
+    try:
+        cb = OpenRouterParetoCallback(
+            rules={"z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)},
+        )
+        cb._resolve_rules()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_telemetry", old)
+    tel = cb._telemetry
+    assert isinstance(tel, Telemetry)
+    assert tel._verify == "/ca.pem"
+
+
+async def test_explicit_rules_raise_on_malformed_telemetry_config() -> None:
+    """Bad telemetry config surfaces loudly even when rules are explicit - it must
+    not be silently ignored because the rule source was injected."""
+    from litellm_plugin_openrouter_pareto.config import RuleConfigError
+
+    old = _set_litellm_attr("openrouter_pareto_telemetry", {"ssl_verfy": False})
+    try:
+        cb = OpenRouterParetoCallback(
+            rules={"z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)},
+        )
+        with pytest.raises(RuleConfigError):
+            cb._resolve_rules()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_telemetry", old)

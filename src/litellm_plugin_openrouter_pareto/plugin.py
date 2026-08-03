@@ -8,7 +8,13 @@ from typing import Protocol, runtime_checkable
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.types.utils import AllMessageValues
 
-from .config import DEFAULT_RULES, Rule, load_rules_from_settings
+from .config import (
+    DEFAULT_RULES,
+    Rule,
+    load_rules_from_settings,
+    load_telemetry_config,
+    telemetry_verify,
+)
 from .cooldown import RateLimitCooldown, is_input_cap_error
 from .error_log import or_error_log
 from .telemetry import CacheEntry, Telemetry
@@ -64,17 +70,31 @@ class OpenRouterParetoCallback(CustomLogger):
         self._telemetry: TelemetrySource = telemetry if telemetry is not None else Telemetry(self._rules)
         self._cooldown = cooldown if cooldown is not None else RateLimitCooldown()
         self._rules_resolved = rules is not None
+        self._telemetry_resolved = telemetry is not None
         self._warned: set[str] = set()
 
     def _resolve_rules(self) -> Mapping[str, Rule]:
-        if self._explicit_rules is not None or self._rules_resolved:
-            return self._rules
-        configured = load_rules_from_settings()
-        if configured is not None:
-            self._rules = configured
-            if self._explicit_telemetry is None:
-                self._telemetry = Telemetry(configured)
-        self._rules_resolved = True
+        # Rules and telemetry-client config are independent domains and are resolved
+        # independently. An explicit `rules=` must NOT suppress global telemetry SSL
+        # config (or its validation), and an explicit `telemetry=` must NOT be
+        # replaced by it. Bad telemetry config raises loudly here, the same place
+        # bad rules config already raises, before any request is routed.
+        rules_changed = False
+        if not self._rules_resolved:
+            if self._explicit_rules is None:
+                configured = load_rules_from_settings()
+                if configured is not None:
+                    self._rules = configured
+                    rules_changed = True
+            self._rules_resolved = True
+        if not self._telemetry_resolved:
+            tel_config = load_telemetry_config()
+            # Rebuild the telemetry client only when something actually changed: a
+            # newly loaded rule set, or an explicit telemetry SSL config. With
+            # neither, the default client built in __init__ (verify=True) is correct.
+            if rules_changed or tel_config is not None:
+                self._telemetry = Telemetry(self._rules, verify=telemetry_verify(tel_config))
+            self._telemetry_resolved = True
         return self._rules
 
     def _is_managed(self, model: str) -> bool:
