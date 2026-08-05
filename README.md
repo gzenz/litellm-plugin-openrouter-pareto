@@ -289,6 +289,12 @@ Rules come from `litellm_settings.openrouter_pareto_rules` or the
 first use rather than silently falling back to defaults. Without any
 `openrouter_pareto_rules`, the built-in default rule for `z-ai/glm-5.2` applies.
 
+Rule keys are the bare OpenRouter id (`z-ai/glm-5.2`). Incoming model groups are
+normalized to that key before lookup: a leading `openrouter/` prefix and a trailing
+`[...]` context tag are stripped. So a client that sends
+`openrouter/z-ai/glm-5.2[1m]` (e.g. Claude Code) matches the same rule as one that
+sends the bare `z-ai/glm-5.2`, without a separate rule entry.
+
 | Field | Default | Purpose |
 |---|---|---|
 | `precision` | `["fp8"]` | Allowed quantizations; a provider endpoint must match one. |

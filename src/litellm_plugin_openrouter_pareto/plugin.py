@@ -22,6 +22,21 @@ from .telemetry import CacheEntry, Telemetry
 _OR_PREFIX = "or-"
 
 
+def _normalize_model_group(model: str) -> str:
+    """The OpenRouter id a rule is keyed on, extracted from the model group litellm
+    hands us. Callers reach a managed model by different names: EverCore sends the
+    bare id (`deepseek/deepseek-v4-flash-0731`), while Claude Code sends the
+    `openrouter/`-prefixed form with a context tag (`openrouter/deepseek/
+    deepseek-v4-flash-0731[1m]`). Rules are authored on the bare id (the key
+    OpenRouter's /v1/models uses), so strip a leading `openrouter/` and a trailing
+    `[...]` tag to recover it. A name that has neither is returned unchanged."""
+    stripped = model.removeprefix("openrouter/")
+    bracket = stripped.find("[")
+    if bracket != -1 and stripped.endswith("]"):
+        stripped = stripped[:bracket]
+    return stripped
+
+
 class StrictProviderConflict(ValueError):
     """A client sent its own `extra_body.provider.only` on a managed model whose rule
     set `strict_provider: true`. The router re-raises this to the caller, so the request
@@ -214,6 +229,7 @@ class OpenRouterParetoCallback(CustomLogger):
         parent_otel_span: object | None = None,
     ) -> list[dict[str, object]]:
         deployments = [healthy_deployments] if isinstance(healthy_deployments, dict) else healthy_deployments
+        model = _normalize_model_group(model)
         rules = self._resolve_rules()
         rule = rules.get(model)
         if rule is None:
@@ -510,7 +526,10 @@ class OpenRouterParetoCallback(CustomLogger):
         end_time: float,
     ) -> None:
         model = kwargs.get("model")
-        if not isinstance(model, str) or not self._is_managed(model):
+        if not isinstance(model, str):
+            return
+        model = _normalize_model_group(model)
+        if not self._is_managed(model):
             return
         exc = kwargs.get("exception")
         if exc is None:

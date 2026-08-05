@@ -119,6 +119,36 @@ async def test_narrows_to_winner_deployment() -> None:
     assert [_id_of(d) for d in result] == ["or-baseten"]
 
 
+@pytest.mark.parametrize(
+    "sent",
+    [
+        "openrouter/z-ai/glm-5.2",
+        "z-ai/glm-5.2[1m]",
+        "openrouter/z-ai/glm-5.2[1m]",
+    ],
+)
+async def test_prefixed_or_tagged_model_matches_bare_rule(sent: str) -> None:
+    cb, stub = _callback(_entry("baseten", ("baseten", "novita", "siliconflow")))
+    result = await cb.async_filter_deployments(sent, _deployments(), None)
+    assert [_id_of(d) for d in result] == ["or-baseten"]
+    assert stub.calls == ["z-ai/glm-5.2"]  # telemetry keyed on the bare id
+
+
+async def test_failure_event_records_cooldown_under_bare_key() -> None:
+    # A failure arriving as the openrouter/-prefixed [1m] form must record the
+    # cooldown under the bare key the routing path checks, or the hot winner is
+    # never skipped.
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 429
+
+    kwargs = _failure_kwargs("baseten/fp8", _Exc(), model="openrouter/z-ai/glm-5.2[1m]")
+    await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is True
+
+
 async def test_winner_not_healthy_falls_back_to_next_preferred_slug() -> None:
     cb, _ = _callback(_entry("baseten", ("baseten", "novita", "siliconflow")))
     healthy = [_dep("or-novita"), _dep("or-siliconflow")]
