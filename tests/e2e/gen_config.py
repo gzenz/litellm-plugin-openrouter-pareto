@@ -17,7 +17,15 @@ import argparse
 import sys
 from pathlib import Path
 
-DEFAULT_PROVIDERS = ["novita/fp8", "siliconflow/fp8", "baseten/fp8", "venice/fp8"]
+DEFAULT_PROVIDERS = [
+    "novita/fp8",
+    "siliconflow/fp8",
+    "baseten/fp8",
+    "crusoe/fp8",
+    "sail-research/fp8",
+    "z-ai/fp8",
+    "venice/fp8",
+]
 OR_MODEL = "openrouter/z-ai/glm-5.2"
 CALLBACK = "litellm_plugin_openrouter_pareto.plugin.openrouter_pareto_callback"
 

@@ -109,6 +109,47 @@ def _failure_kwargs(slug: str, exc: object, model: str = "z-ai/glm-5.2") -> dict
     }
 
 
+def _post_call_request_data(
+    slug: str | None,
+    model: str = "z-ai/glm-5.2",
+    call_type: str = "pass_through_endpoint",
+    *,
+    slug_site: str = "provider",
+    only: list[str] | None = None,
+    response_body: dict[str, Any] | str | None = None,
+) -> dict[str, Any]:
+    """request_data handed to async_post_call_failure_hook: the merged request body +
+    litellm kwargs, with call_type=pass_through_endpoint. slug_site picks where the
+    provider pin lands so the extractor is exercised across landing sites (top-level
+    OpenRouter `provider` body field, top-level `extra_body`, or
+    `optional_params.extra_body` -- the operator-reported site). `only` overrides the
+    top-level provider.only list (to exercise ambiguous/empty allowlists)."""
+    body: dict[str, Any] = {"model": model, "call_type": call_type}
+    if response_body is not None:
+        body["response_body"] = response_body
+    if slug is None and only is None:
+        return body
+    if slug_site == "provider":
+        body["provider"] = {"only": only if only is not None else [slug]}
+    elif slug_site == "extra_body":
+        body["extra_body"] = {"provider": {"only": only if only is not None else [slug]}}
+    elif slug_site == "optional_params":
+        body["optional_params"] = {"extra_body": {"provider": {"only": only if only is not None else [slug]}}}
+    return body
+
+
+class _SyntheticUpstreamExc:
+    """Mimics litellm's passthrough upstream-failure HTTPException: a generic
+    detail that carries only the status, NOT the upstream error text (which lives
+    in request_data["response_body"])."""
+
+    def __init__(self, status_code: int) -> None:
+        self.status_code = status_code
+
+    def __str__(self) -> str:
+        return f"{self.status_code}: Upstream passthrough request failed with status {self.status_code}"
+
+
 def _deployments() -> list[dict[str, object]]:
     return [_dep("or-baseten"), _dep("or-novita"), _dep("or-siliconflow")]
 
@@ -281,6 +322,306 @@ async def test_or_dash_only_id_falls_back_to_extra_body() -> None:
     }
     await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
     assert cd.is_hot("z-ai/glm-5.2", "novita/fp8") is True
+
+
+async def test_post_call_failure_records_429_on_passthrough() -> None:
+    # The only failure signal litellm fires for a raw passthrough request is
+    # async_post_call_failure_hook; without it, the 429 never reaches the cooldown.
+    # Real litellm shape: a synthetic HTTPException (generic detail) + the parsed
+    # upstream body in response_body. 429 detection is by status_code.
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    request_data = _post_call_request_data(
+        "baseten/fp8",
+        response_body={"error": {"message": "Rate limit exceeded"}},
+    )
+    await cb.async_post_call_failure_hook(request_data, _SyntheticUpstreamExc(429), None, None)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is True
+
+
+async def test_post_call_failure_records_input_cap_from_response_body() -> None:
+    # The passthrough upstream-failure path supplies only a generic HTTPException
+    # detail; the input-length text lives in request_data["response_body"]. The
+    # hook must read it there or the input-cap is never recorded.
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(_entry("baseten/fp8", ("baseten/fp8",)), cooldown=cd)
+
+    request_data = _post_call_request_data(
+        "baseten/fp8",
+        response_body={
+            "error": {"message": "Input length 562514 exceeds the maximum allowed input length of 524256 tokens"}
+        },
+    )
+    await cb.async_post_call_failure_hook(request_data, _SyntheticUpstreamExc(400), None, None)
+    assert cd.is_input_capped("z-ai/glm-5.2", "baseten/fp8") is True
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+async def test_post_call_failure_input_cap_missing_body_not_recorded() -> None:
+    # No response_body and a generic synthetic exception -> the input-cap regex
+    # has nothing to match, so nothing is recorded (no false positive from the
+    # bare "failed with status 400" detail).
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(_entry("baseten/fp8", ("baseten/fp8",)), cooldown=cd)
+
+    request_data = _post_call_request_data("baseten/fp8")
+    await cb.async_post_call_failure_hook(request_data, _SyntheticUpstreamExc(400), None, None)
+    assert cd.is_input_capped("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+@pytest.mark.parametrize("call_type", ["acompletion", "anthropic_messages", ""])
+async def test_post_call_failure_ignores_non_passthrough(call_type: str) -> None:
+    # On non-passthrough paths async_log_failure_event already records; recording
+    # here too would double-count and trip the 3-hit cooldown early. The call_type
+    # guard keeps this hook a strict no-op outside the passthrough path.
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 429
+
+    request_data = _post_call_request_data("baseten/fp8", call_type=call_type)
+    await cb.async_post_call_failure_hook(request_data, _Exc(), None, None)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+async def test_post_call_failure_ignores_unmanaged_model() -> None:
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 429
+
+    request_data = _post_call_request_data("baseten/fp8", model="openai/gpt-4o")
+    await cb.async_post_call_failure_hook(request_data, _Exc(), None, None)
+    assert cd.is_hot("openai/gpt-4o", "baseten/fp8") is False
+
+
+async def test_post_call_failure_ignores_non_429() -> None:
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 500
+
+    request_data = _post_call_request_data("baseten/fp8")
+    await cb.async_post_call_failure_hook(request_data, _Exc(), None, None)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+async def test_post_call_failure_ignores_missing_model() -> None:
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 429
+
+    request_data: dict[str, Any] = {"call_type": "pass_through_endpoint"}
+    await cb.async_post_call_failure_hook(request_data, _Exc(), None, None)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+@pytest.mark.parametrize("slug_site", ["provider", "extra_body", "optional_params"])
+async def test_post_call_failure_slug_resolves_across_landing_sites(slug_site: str) -> None:
+    # The passthrough request_data is the merged body + kwargs, not
+    # model_call_details; the pin can land at several sites depending on how the
+    # request arrived. The extractor must find it at any of them.
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 429
+
+    request_data = _post_call_request_data("baseten/fp8", slug_site=slug_site)
+    await cb.async_post_call_failure_hook(request_data, _Exc(), None, None)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is True
+
+
+async def test_post_call_failure_normalizes_prefixed_tagged_model() -> None:
+    # Claude Code sends the openrouter/-prefixed [1m] form; the cooldown must be
+    # recorded under the bare rule key the routing path checks.
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 429
+
+    request_data = _post_call_request_data(
+        "baseten/fp8", model="openrouter/z-ai/glm-5.2[1m]"
+    )
+    await cb.async_post_call_failure_hook(request_data, _Exc(), None, None)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is True
+
+
+async def test_post_call_failure_no_slug_is_safe_noop(capsys: pytest.CaptureFixture[str]) -> None:
+    # A managed passthrough 429 with no resolvable slug must not raise into the
+    # request path and must not record under a wrong key; it warns once instead.
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 429
+
+    request_data = _post_call_request_data(None)
+    await cb.async_post_call_failure_hook(request_data, _Exc(), None, None)
+    assert cd.is_hot("z-ai/glm-5.2", "") is False
+    assert "no resolvable provider slug" in capsys.readouterr().err
+
+
+async def test_post_call_failure_no_double_record_with_log_failure_event() -> None:
+    # Documents the guard's purpose: when both hooks would see the same acompletion
+    # failure, only async_log_failure_event records. Simulate that by firing the
+    # post-call hook on a non-passthrough call_type and asserting zero hits,
+    # while the log-failure path (same exc/slug) still records once.
+    cd = RateLimitCooldown(threshold=2)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 429
+
+    log_kwargs = _failure_kwargs("baseten/fp8", _Exc())
+    post_data = _post_call_request_data("baseten/fp8", call_type="acompletion")
+
+    await cb.async_post_call_failure_hook(post_data, _Exc(), None, None)  # guarded -> no record
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is False
+    await cb.async_log_failure_event(log_kwargs, None, 0.0, 0.0)  # the path that owns recording
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is False
+    await cb.async_log_failure_event(log_kwargs, None, 0.0, 0.0)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is True
+
+
+@pytest.mark.parametrize(
+    "only_value",
+    [
+        ["baseten/fp8", "novita/fp8"],  # multiple providers
+        [],  # empty allowlist
+        "baseten/fp8",  # not a list at all
+        [""],  # empty slug string
+        None,  # present but null -- must NOT fall through (key present, not absent)
+    ],
+    ids=["multi", "empty", "non-list", "empty-slug", "null"],
+)
+async def test_post_call_failure_ambiguous_top_level_provider_only_returns_none(
+    only_value: list[str] | str | None,
+) -> None:
+    # A present-but-ambiguous top-level provider.only cannot be attributed to one
+    # provider. It must NOT fall through to a secondary copy (here a singleton under
+    # optional_params) -- that would cool down the wrong provider. A present null is
+    # treated as malformed (the key exists), not as absent. Empty slugs are rejected
+    # too, consistently with the deployment slug extractor.
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 429
+
+    request_data: dict[str, Any] = {
+        "model": "z-ai/glm-5.2",
+        "call_type": "pass_through_endpoint",
+        "provider": {"only": only_value},
+        "optional_params": {"extra_body": {"provider": {"only": ["baseten/fp8"]}}},
+    }
+    await cb.async_post_call_failure_hook(request_data, _Exc(), None, None)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is False
+    assert cd.is_hot("z-ai/glm-5.2", "novita/fp8") is False
+
+
+async def test_post_call_failure_absent_only_falls_through_to_other_sites() -> None:
+    # A top-level provider block without `only` (e.g. only quantizations) did not
+    # pin, so the extractor may still resolve the pin from a secondary site.
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 429
+
+    request_data: dict[str, Any] = {
+        "model": "z-ai/glm-5.2",
+        "call_type": "pass_through_endpoint",
+        "provider": {"quantizations": ["fp8"]},
+        "optional_params": {"extra_body": {"provider": {"only": ["baseten/fp8"]}}},
+    }
+    await cb.async_post_call_failure_hook(request_data, _Exc(), None, None)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is True
+
+
+async def test_post_call_failure_passthrough_shape_records_under_pinned_slug() -> None:
+    # Shape test (not a live-contract test): build request_data the way litellm
+    # does for a non-streaming passthrough upstream 429 -- the parsed request body
+    # + the passthrough kwargs (call_type=pass_through_endpoint) + response_body
+    # (parsed upstream JSON) -- and a synthetic HTTPException whose detail carries
+    # only the status. Proves the hook records under the pinned slug from the
+    # merged shape. Does NOT prove litellm still emits this shape; the streaming
+    # path omits response_body (see test_post_call_failure_streaming_input_cap_undetected).
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    parsed_body: dict[str, Any] = {
+        "model": "openrouter/z-ai/glm-5.2[1m]",
+        "messages": [{"role": "user", "content": "hi"}],
+        "provider": {"only": ["baseten/fp8"]},
+    }
+    passthrough_kwargs: dict[str, Any] = {
+        "call_type": "pass_through_endpoint",
+        "litellm_call_id": "test-call-id",
+        "litellm_params": {"metadata": {}},
+    }
+    request_data: dict[str, Any] = {**parsed_body, **passthrough_kwargs}
+    request_data["response_body"] = {"error": {"message": "Too many requests"}}
+
+    await cb.async_post_call_failure_hook(request_data, _SyntheticUpstreamExc(429), None, None)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is True
+
+
+async def test_post_call_failure_streaming_429_still_recorded() -> None:
+    # Streaming passthrough omits response_body, but 429 detection is by status
+    # code, so the cooldown still records for the primary (rate-limit) use case.
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten",)), cooldown=cd)
+
+    request_data = _post_call_request_data("baseten/fp8")  # no response_body, as on the streaming path
+    await cb.async_post_call_failure_hook(request_data, _SyntheticUpstreamExc(429), None, None)
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is True
+
+
+async def test_post_call_failure_streaming_input_cap_undetected() -> None:
+    # KNOWN LIMITATION (documented on async_post_call_failure_hook): litellm's
+    # streaming passthrough failure path dispatches this hook WITHOUT
+    # response_body (reading the stream body would consume it and break relay).
+    # The input-cap text therefore cannot be read, so a 400 input-cap on a
+    # streaming passthrough is NOT recorded. 429 (above) still works. This test
+    # pins the limitation so a regression here is a deliberate decision, not an
+    # accident.
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(_entry("baseten/fp8", ("baseten/fp8",)), cooldown=cd)
+
+    request_data = _post_call_request_data("baseten/fp8")  # no response_body
+    await cb.async_post_call_failure_hook(request_data, _SyntheticUpstreamExc(400), None, None)
+    assert cd.is_input_capped("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+@pytest.mark.parametrize(
+    "response_body",
+    [
+        {"error": {"message": "exceeds the maximum allowed input length"}},
+        {"error": "exceeds the maximum allowed input length"},
+        {"message": "maximum context length exceeded"},
+        "exceeds the maximum allowed input length",
+    ],
+    ids=["nested-error", "string-error", "top-message", "string-body"],
+)
+async def test_upstream_message_extracts_input_cap_across_shapes(
+    response_body: dict[str, Any] | str,
+) -> None:
+    # _upstream_message must surface the provider error text from each shape
+    # OpenRouter/litellm might produce, so is_input_cap_error can match it.
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(_entry("baseten/fp8", ("baseten/fp8",)), cooldown=cd)
+
+    request_data = _post_call_request_data("baseten/fp8", response_body=response_body)
+    await cb.async_post_call_failure_hook(request_data, _SyntheticUpstreamExc(400), None, None)
+    assert cd.is_input_capped("z-ai/glm-5.2", "baseten/fp8") is True
 
 
 async def test_nonempty_unmatched_healthy_returns_full_list() -> None:

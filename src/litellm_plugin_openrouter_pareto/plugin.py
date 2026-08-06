@@ -192,6 +192,29 @@ class OpenRouterParetoCallback(CustomLogger):
                 model_info = mi
         return self._slug_from_params(litellm_params, model_info)
 
+    def _slug_from_request_data(self, request_data: Mapping[str, object]) -> str | None:
+        # The passthrough failure hook's request_data is the merged request body
+        # + litellm kwargs, NOT model_call_details. The top-level OpenRouter
+        # `provider.only` body field is what OpenRouter actually used, so treat it
+        # as authoritative: a singleton non-empty slug is the attribution; a
+        # present-but-ambiguous `only` (multiple providers, empty, malformed, or
+        # null) cannot be attributed to one slug, so return None rather than
+        # reinterpreting it via a secondary copy in optional_params / extra_body
+        # (that would cool down the wrong provider). Only an absent `only` key
+        # falls through to the other sites, which mirror _slug_from_kwargs.
+        provider = request_data.get("provider")
+        if isinstance(provider, Mapping) and "only" in provider:
+            only = provider["only"]
+            if isinstance(only, list) and len(only) == 1:
+                sole = only[0]
+                if isinstance(sole, str) and sole:
+                    return sole
+            # Present but ambiguous (multiple, empty, malformed, or null): the
+            # top-level field is authoritative, so do not reinterpret it via a
+            # secondary copy in optional_params / extra_body.
+            return None
+        return self._slug_from_kwargs(request_data)
+
     def _preferred_slugs(self, model: str, entry: CacheEntry) -> tuple[str, ...]:
         candidates = (entry.winner, *entry.safe_set) if entry.winner is not None else entry.safe_set
         unique = dict.fromkeys(candidates)
@@ -518,6 +541,29 @@ class OpenRouterParetoCallback(CustomLogger):
             return match
         return self._with_provider_only(match, slug)
 
+    def _apply_rate_limit_signal(
+        self,
+        model: str,
+        status: object,
+        message: str,
+        slug: str | None,
+        rule: Rule | None,
+    ) -> None:
+        """Log the failure (if the rule wants it) and record the cooldown hit.
+
+        Shared by the two failure hooks so they cannot drift on what counts as
+        a 429 vs an input cap, or on the error-line shape. Returns without
+        recording when the provider slug is unresolvable."""
+        if isinstance(status, int) and status >= 400 and rule is not None and rule.log_errors:
+            trimmed = message[:1000]
+            or_error_log(f"model={model} slug={slug} status={status} body={trimmed}")
+        if slug is None:
+            return
+        if status == 429:
+            self._cooldown.record(model, slug)
+        elif is_input_cap_error(status, message):
+            self._cooldown.record_input_cap(model, slug)
+
     async def async_log_failure_event(
         self,
         kwargs: Mapping[str, object],
@@ -538,15 +584,87 @@ class OpenRouterParetoCallback(CustomLogger):
         message = str(exc)
         slug = self._slug_from_kwargs(kwargs)
         rule = self._resolve_rules().get(model)
-        if isinstance(status, int) and status >= 400 and rule is not None and rule.log_errors:
-            trimmed = message[:1000]
-            or_error_log(f"model={model} slug={slug} status={status} body={trimmed}")
-        if slug is None:
-            return
-        if status == 429:
-            self._cooldown.record(model, slug)
-        elif is_input_cap_error(status, message):
-            self._cooldown.record_input_cap(model, slug)
+        self._apply_rate_limit_signal(model, status, message, slug, rule)
+
+    def _upstream_message(
+        self, request_data: Mapping[str, object], original_exception: object
+    ) -> str:
+        """The error text used for input-cap detection and the error log.
+
+        The passthrough upstream-failure path supplies a synthetic HTTPException
+        whose detail is only "Upstream passthrough request failed with status N";
+        the real provider error (e.g. an input-length message) lives in
+        ``request_data["response_body"]`` (the parsed upstream JSON litellm sets
+        at pass_through_endpoints.py). Fall back to the exception string when no
+        upstream body is available (e.g. an outer LiteLLM exception)."""
+        rb = request_data.get("response_body")
+        if isinstance(rb, Mapping):
+            err = rb.get("error")
+            if isinstance(err, Mapping):
+                msg = err.get("message")
+                if isinstance(msg, str) and msg:
+                    return msg
+            elif isinstance(err, str) and err:
+                return err
+            msg = rb.get("message")
+            if isinstance(msg, str) and msg:
+                return msg
+        elif isinstance(rb, str) and rb:
+            return rb
+        return str(original_exception)
+
+    async def async_post_call_failure_hook(
+        self,
+        request_data: Mapping[str, object],
+        original_exception: object,
+        user_api_key_dict: object,
+        traceback_str: str | None = None,
+    ) -> None:
+        """The only failure signal litellm fires for a raw passthrough request.
+
+        A passthrough forward is raw httpx; there is no litellm ``completion()``
+        call, so ``Logging.async_failure_handler`` (which dispatches
+        ``async_log_failure_event``) never runs. The only hook litellm fires on
+        that path is ``async_post_call_failure_hook`` (proxy/utils.py post-call
+        failure loop), so the 429 would never reach ``RateLimitCooldown.record``
+        without this hook.
+
+        Guarded to the passthrough path: on every other path (acompletion,
+        anthropic_messages) ``async_log_failure_event`` already records, so
+        recording here too would double-count and trip the 3-hit cooldown early.
+        The passthrough failure ``request_data`` carries
+        ``call_type="pass_through_endpoint"``.
+
+        Limitation: 429s are detected by status code on both streaming and
+        non-streaming passthrough. Input-cap (400) detection needs the upstream
+        error text, which litellm attaches as ``request_data["response_body"]``
+        only on the NON-streaming passthrough failure path; the streaming path
+        dispatches this hook without it (reading the stream body would consume it
+        and break the relay to the client). So input-cap is not detected for
+        streaming passthrough - a known limitation. See ``_upstream_message``."""
+        call_type = request_data.get("call_type")
+        if call_type != "pass_through_endpoint":
+            return None
+        model = request_data.get("model")
+        if not isinstance(model, str):
+            return None
+        model = _normalize_model_group(model)
+        if not self._is_managed(model):
+            return None
+        status = getattr(original_exception, "status_code", None)
+        message = self._upstream_message(request_data, original_exception)
+        slug = self._slug_from_request_data(request_data)
+        rule = self._resolve_rules().get(model)
+        self._apply_rate_limit_signal(model, status, message, slug, rule)
+        if slug is None and isinstance(status, int) and status >= 400:
+            self._warn_once(
+                f"postfail-no-slug:{model}",
+                f"openrouter-pareto: passthrough failure on managed {model} "
+                f"(status={status}) had no resolvable provider slug in request_data "
+                f"(keys={sorted(request_data.keys())}); cooldown not recorded for "
+                f"this request\n",
+            )
+        return None
 
 
 openrouter_pareto_callback = OpenRouterParetoCallback()
