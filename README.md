@@ -137,21 +137,55 @@ transitory upstream rate limit, handled in two layers:
 
 - **Per-request walk.** LiteLLM puts the 429'ing deployment in cooldown immediately
   and its retry re-runs deployment selection, so the next attempt lands on a different
-  provider. Bound this with `num_retries` on the model group.
+  provider. This helps the non-wildcard (multi-deployment) mode, where each provider
+  is its own deployment and the retry can pick another. In wildcard mode the plugin
+  injects the winner as a single pinned deployment with `allow_fallbacks: false`, so
+  a litellm retry of a 429 hits the *same* pinned provider again - the retry cannot
+  reroute until the plugin's cross-request cooldown (below) flips the winner on the
+  next request. See "Retry policy for wildcard mode" below.
 - **Cross-request cooldown.** The plugin tracks 429s per provider. A provider that
   429s three or more times within five minutes is "hot" and is skipped as the winner
-  for new requests until its 429s age out of the window. This is the memory LiteLLM's
-  short per-429 cooldown lacks; it stops a persistently rate-limited winner from being
-  retried first on every new request.
-
-```yaml
-litellm_settings:
-  num_retries: 3   # bounds the per-request walk across providers
-```
+  for new requests until its 429s age out of the window (both defaults are tunable;
+  see Cooldown tuning below). This is the memory LiteLLM's short per-429 cooldown
+  lacks; it stops a persistently rate-limited winner from being retried first on
+  every new request.
 
 The cross-request cooldown is in-process and not persisted; it resets on restart.
-When every provider is hot, the plugin keeps the constrained winner rather than
-emitting unconstrained routing.
+When every provider in the safe set is hot, the plugin raises
+`AllProvidersOnCooldown` (surfaced to the caller as a failed request) rather than
+re-pinning a known-failing provider or ceding to OpenRouter's own selection, which
+would bypass `max_price`, `exclude_regions`, and the precision/context filters. A
+single non-hot provider in the safe set is still pinned; only an all-429-hot list
+stops routing. Input caps never raise this - a capped provider is still tried (a
+small request may succeed under the cap), and only the 429 cooldown is a hard stop.
+
+### Retry policy for wildcard mode
+
+In wildcard mode the plugin pins one provider per request with `allow_fallbacks: false`.
+LiteLLM's default retries a 429 on that same provider before surfacing it, so one
+rate-limited request burns up to `num_retries + 1` wire attempts against the same
+hot provider before the plugin ever sees a failure to record. During a shared-pool
+storm this multiplies the wire 429 count roughly 3x without helping - the retry
+cannot fall off the hot provider, and the provider does not self-heal in 2 attempts.
+
+Setting `RateLimitErrorRetries: 0` surfaces a 429 to the plugin on the first attempt,
+so the cross-request cooldown trips after three *requests* (not nine wire hits) and
+reroutes the next request immediately. The plugin's own cooldown replaces litellm's
+transient-blip cushion for this workload - across observed shared-pool storms the
+default cushion never self-healed a provider, it only extended the death rattle. For
+non-wildcard (multi-deployment) mode where retries do reroute across deployments,
+leave the default or set a positive value.
+
+```yaml
+router_settings:
+  retry_policy:
+    RateLimitErrorRetries: 0   # wildcard mode: trip cooldown on first 429, reroute next request
+```
+
+For the 400 (input-cap) path, LiteLLM does not retry by default, so a small
+`BadRequestErrorRetries` is still useful there to get the per-request reroute (see
+the next section). These are independent knobs: `RateLimitErrorRetries` governs 429,
+`BadRequestErrorRetries` governs 400.
 
 ## Use case: skip providers that reject oversized input (400)
 
@@ -309,6 +343,7 @@ sends the bare `z-ai/glm-5.2`, without a separate rule entry.
 | `unverified_region_policy` | `"no_route"` | Cold-start behavior under a region policy: `no_route`, `unpinned`, or `trust_fallback`. |
 | `cold_start_fallback` | `[]` | Provider slugs trusted under `trust_fallback`. |
 | `strict_provider` | `false` | `true` rejects a client-supplied `provider.only` on this model. |
+| `max_price` | `null` | Optional ceiling on input price per million tokens. A provider whose input price exceeds it is dropped before the value walk, so a runaway-priced provider can never become the winner or land in the safe set. `null` means no ceiling. |
 
 `log_errors: true` writes to `OPENROUTER_PARETO_ERROR_LOG` (default a platformdirs user
 log path: `errors.log` under the OS log directory), created owner-only (`0o600`, no
@@ -339,19 +374,50 @@ LiteLLM connects to OpenRouter for model traffic. A bad `ssl_ca_cert` path surfa
 a telemetry degradation warning (stale or no winner) and the plugin falls back to the
 healthy deployment set unchanged - it never raises into the request path.
 
+## Cooldown tuning
+
+The 429 cross-request cooldown and the input-cap skip share one global (not per-model)
+cooldown store, so their window, threshold, and TTL are process-wide properties of
+rate-limit handling. They are tunable under `litellm_settings.openrouter_pareto_cooldown`
+or the `OPENROUTER_PARETO_COOLDOWN` JSON env var (unknown fields raise at first use):
+
+```yaml
+litellm_settings:
+  openrouter_pareto_cooldown:
+    rate_limit_window_s: 300      # 429s age out of the window after this many seconds
+    rate_limit_threshold: 3       # this many 429s within the window makes a provider "hot"
+    input_cap_ttl_s: 3600         # a 400 input-cap skip lasts this long before the provider is retried
+```
+
+| Field | Default | Purpose |
+|---|---|---|
+| `rate_limit_window_s` | `300` | Sliding window over which 429s are counted, in seconds. |
+| `rate_limit_threshold` | `3` | 429 count within the window that marks a provider hot and skips it as the winner. |
+| `input_cap_ttl_s` | `3600` | How long a 400 input-cap skip lasts before the provider is eligible again, in seconds. |
+
+The cooldown is in-process and not persisted; it resets on restart, and with multiple
+workers each worker tracks 429s independently.
+
 ## How selection works
 
 - Telemetry is cached and refreshed on a 5-minute poll. A new value-winner must win
   `promotion_polls` consecutive polls before it is promoted. A winner that stops
   passing the hard filters is evicted immediately.
 - On stale or empty telemetry, or no winner, the full healthy deployment set is
-  returned unchanged. Absent a region policy the callback never narrows to an empty
-  list from telemetry states; an all-input-capped state falls back to the winner (a
-  preference skip, not a hard exclusion, since a small request may still succeed under
-  the cap).
-- If the winner is in cooldown or not healthy, it falls back to the next preferred
-  provider in the safe set (cheapest-first), then to the full list, restricted (when a
-  region policy is set) to region-eligible deployments.
+  returned unchanged (pinned mode); in wildcard mode the cold-start fallback list is
+  walked instead. Telemetry states never narrow to an empty list on their own. An
+  all-input-capped state falls back to the winner (a preference skip, not a hard
+  exclusion, since a small request may still succeed under the cap). In wildcard
+  mode the only hard stop that narrows to nothing is an all-429-hot safe set, which
+  raises `AllProvidersOnCooldown` (see the 429 use case) rather than cede to
+  OpenRouter. Pinned mode does not raise: each provider is its own litellm
+  deployment, so litellm's own per-deployment 429 cooldown already removes a
+  rate-limited deployment from the healthy set, and the plugin hands back the
+  winner if its slug is still among them.
+- If the winner is in 429 cooldown or not healthy, it falls back to the next
+  non-cooldown provider in the safe set (winner then cheapest-first), keeping trying
+  the list until one is not on cooldown; in wildcard mode only an all-429-hot list
+  raises.
 - The telemetry cache is stored per `(model, rule)` fingerprint, so a worker configured
   with `exclude_regions` never inherits a winner computed by a worker without it, and
   two workers with different policies for the same model do not evict each other's

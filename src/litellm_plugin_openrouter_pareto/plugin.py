@@ -11,6 +11,7 @@ from litellm.types.utils import AllMessageValues
 from .config import (
     DEFAULT_RULES,
     Rule,
+    load_cooldown_config,
     load_rules_from_settings,
     load_telemetry_config,
     telemetry_verify,
@@ -41,6 +42,18 @@ class StrictProviderConflict(ValueError):
     """A client sent its own `extra_body.provider.only` on a managed model whose rule
     set `strict_provider: true`. The router re-raises this to the caller, so the request
     fails loudly instead of the plugin silently overriding the client's choice."""
+
+
+class AllProvidersOnCooldown(ValueError):
+    """Every provider in the safe set (or cold-start fallback list) for a managed
+    model is on a 429 cooldown. Raised from the deployment filter instead of
+    returning []: an empty list makes the router raise a generic
+    RouterRateLimitError whose cooldown_list is read from litellm's own
+    cooldown cache, which is empty here (the plugin's RateLimitCooldown is a
+    separate in-process store), so the surfaced error carries no reason. The
+    router re-raises filter exceptions verbatim (same path as
+    StrictProviderConflict), so this surfaces the plugin's own message. Input
+    caps and region policy never raise this - only an all-429-hot state does."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +99,7 @@ class OpenRouterParetoCallback(CustomLogger):
         self._cooldown = cooldown if cooldown is not None else RateLimitCooldown()
         self._rules_resolved = rules is not None
         self._telemetry_resolved = telemetry is not None
+        self._cooldown_resolved = cooldown is not None
         self._warned: set[str] = set()
 
     def _resolve_rules(self) -> Mapping[str, Rule]:
@@ -110,6 +124,18 @@ class OpenRouterParetoCallback(CustomLogger):
             if rules_changed or tel_config is not None:
                 self._telemetry = Telemetry(self._rules, verify=telemetry_verify(tel_config))
             self._telemetry_resolved = True
+        if not self._cooldown_resolved:
+            cd_config = load_cooldown_config()
+            # Rebuild the cooldown only when an explicit cooldown config is present.
+            # An explicit `cooldown=` passed to __init__ (tests, direct callers) is
+            # honored as-is and never replaced by global config.
+            if cd_config is not None:
+                self._cooldown = RateLimitCooldown(
+                    window_s=cd_config.rate_limit_window_s,
+                    threshold=cd_config.rate_limit_threshold,
+                    input_cap_ttl_s=cd_config.input_cap_ttl_s,
+                )
+            self._cooldown_resolved = True
         return self._rules
 
     def _is_managed(self, model: str) -> bool:
@@ -215,10 +241,19 @@ class OpenRouterParetoCallback(CustomLogger):
             return None
         return self._slug_from_kwargs(request_data)
 
-    def _preferred_slugs(self, model: str, entry: CacheEntry) -> tuple[str, ...]:
+    def _ordered_candidates(self, entry: CacheEntry) -> tuple[str, ...]:
+        """The winner then the safe set, deduped preserving order. This is the
+        ranked list the value walk produced; selection walks it to find the
+        first provider that is usable right now."""
         candidates = (entry.winner, *entry.safe_set) if entry.winner is not None else entry.safe_set
-        unique = dict.fromkeys(candidates)
-        return tuple(slug for slug in unique if not self._cooldown.is_skipped(model, slug))
+        return tuple(dict.fromkeys(candidates))
+
+    def _preferred_slugs(self, model: str, entry: CacheEntry) -> tuple[str, ...]:
+        return tuple(
+            slug
+            for slug in self._ordered_candidates(entry)
+            if not self._cooldown.is_skipped(model, slug)
+        )
 
     def _client_provider_only(self, request_kwargs: dict[str, object] | None) -> bool:
         """Whether the caller sent its own `provider.only`. Read-only; the plugin never
@@ -282,9 +317,28 @@ class OpenRouterParetoCallback(CustomLogger):
     ) -> list[dict[str, object]]:
         if entry is None or entry.stale or entry.winner is None:
             return self._wildcard_fallback(model, rule, deployments, entry)
-        preferred = self._preferred_slugs(model, entry)
-        slug = preferred[0] if preferred else entry.winner
-        return self._with_provider_only(deployments, slug)
+        # On 429: keep trying our own list (winner then safe set) until a
+        # provider is not on cooldown. Input cap is a soft preference, not a
+        # skip: prefer a non-capped provider, but if every non-hot provider is
+        # capped fall back to the first non-hot (the winner if it is not hot)
+        # - a small request may still succeed under the cap, better to try than
+        # to fail. Only an all-429-hot list is a hard stop.
+        not_hot = tuple(
+            slug
+            for slug in self._ordered_candidates(entry)
+            if not self._cooldown.is_hot(model, slug)
+        )
+        if not not_hot:
+            raise AllProvidersOnCooldown(
+                f"openrouter-pareto: every provider for {model} is on a 429 "
+                f"cooldown; declining to route until one clears. "
+                f"winner={entry.winner} safe_set={entry.safe_set}"
+            )
+        not_capped = tuple(
+            slug for slug in not_hot if not self._cooldown.is_input_capped(model, slug)
+        )
+        chosen = not_capped[0] if not_capped else not_hot[0]
+        return self._with_provider_only(deployments, chosen)
 
     def _region_allows(self, model: str, rule: Rule, slug: str, entry: CacheEntry | None) -> bool:
         """Whether a cold-start fallback slug may be pinned under the region policy.
@@ -331,21 +385,52 @@ class OpenRouterParetoCallback(CustomLogger):
         deployments: list[dict[str, object]],
         entry: CacheEntry | None = None,
     ) -> list[dict[str, object]]:
+        # Cold start (no winner): walk the operator-vetted fallback list. On 429
+        # keep trying until a fallback is not on cooldown. Input cap is a soft
+        # preference, matched to the warm path: prefer a non-capped fallback, and
+        # only fall back to a capped one (better to try than to fail - a small
+        # request may fit under the cap) when every eligible fallback is capped.
+        # Region eligibility is checked first: a region-ineligible fallback is
+        # unusable, so it does not count toward the all-hot diagnosis (an
+        # ineligible non-hot provider must not mask every eligible provider being
+        # 429-hot). Only an all-429-hot ELIGIBLE fallback list is a hard stop.
+        eligible: list[str] = []
+        any_eligible = False
         for slug in rule.cold_start_fallback:
-            if self._cooldown.is_skipped(model, slug):
-                continue
             if not self._region_allows(model, rule, slug, entry):
                 continue
-            return self._with_provider_only(deployments, slug)
-        if rule.exclude_regions and rule.unverified_region_policy in ("no_route", "trust_fallback"):
-            self._warn_once(
-                f"region-no-route:{model}",
-                f"openrouter-pareto: no region-verified provider for {model}; "
-                f"declining to route (unverified_region_policy="
-                f"{rule.unverified_region_policy})\n",
+            any_eligible = True
+            if self._cooldown.is_hot(model, slug):
+                continue
+            eligible.append(slug)
+        if eligible:
+            not_capped = [
+                s for s in eligible if not self._cooldown.is_input_capped(model, s)
+            ]
+            chosen = not_capped[0] if not_capped else eligible[0]
+            return self._with_provider_only(deployments, chosen)
+        if any_eligible:
+            # At least one fallback was region-eligible and every one of them was
+            # 429-hot (none made it into `eligible`).
+            raise AllProvidersOnCooldown(
+                f"openrouter-pareto: every region-eligible cold-start fallback for "
+                f"{model} is on a 429 cooldown; declining to route until one "
+                f"clears. fallback={rule.cold_start_fallback}"
             )
-            return []
-        return self._unpinned_result(deployments)
+        # No fallback was region-eligible (or none is configured). Under
+        # `unpinned` the operator opted into ceding to OpenRouter (matching
+        # pinned mode); anything else declines to route rather than cede, since
+        # OpenRouter's auto-selection would bypass max_price, exclude_regions,
+        # and the precision/context filters.
+        if rule.exclude_regions and rule.unverified_region_policy == "unpinned":
+            return self._unpinned_result(deployments)
+        self._warn_once(
+            f"all-hot:{model}",
+            f"openrouter-pareto: no usable cold-start fallback for {model} "
+            f"(region-ineligible or none configured); declining to route. "
+            f"fallback={rule.cold_start_fallback}\n",
+        )
+        return []
 
     def _unpinned_result(
         self,

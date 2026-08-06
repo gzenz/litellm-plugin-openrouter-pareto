@@ -1,12 +1,17 @@
 """Generate the OpenRouter pareto e2e proxy config (real providers only).
 
-Writes or_pareto_config.yaml with the model group z-ai/glm-5.2 across multiple
-real OpenRouter provider deployments, each pinned via extra_body.provider.only
-and model_info.id=or-<slug>, the package callback registered, and num_retries=3.
+Writes or_pareto_config.yaml with the model group deepseek/deepseek-v4-flash-0731
+across multiple real OpenRouter provider deployments, each pinned via
+extra_body.provider.only and model_info.id=or-<slug>, the package callback
+registered, and num_retries=3.
 
 No mocks or local fixtures: the e2e proves only what real OpenRouter can
 deterministically show (winner selection, stale-telemetry passthrough). The 429
 cooldown is unit-tested in test_cooldown.py / test_plugin.py, not here.
+
+The rule is emitted explicitly (deepseek/deepseek-v4-flash-0731 is not in the
+package DEFAULT_RULES, which only ships z-ai/glm-5.2), so the config is
+self-contained and does not depend on the shipped defaults.
 
 Usage: python3 tests/e2e/gen_config.py [--out PATH] [--providers a,b,c]
 """
@@ -17,46 +22,55 @@ import argparse
 import sys
 from pathlib import Path
 
+MODEL_NAME = "deepseek/deepseek-v4-flash-0731"
+OR_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
+CALLBACK = "litellm_plugin_openrouter_pareto.plugin.openrouter_pareto_callback"
+# fp8 + >=1M context providers on OpenRouter with enough stats to score
+# (baidu/fp8 has no request stats yet, so it is omitted - it would be dropped
+# at Stage 1 and never selected). baseten/fp8 is cheapest + fastest, so it is
+# the expected value-walk winner; the rest form the safe set.
 DEFAULT_PROVIDERS = [
     "novita/fp8",
     "siliconflow/fp8",
     "baseten/fp8",
-    "crusoe/fp8",
-    "sail-research/fp8",
-    "z-ai/fp8",
-    "venice/fp8",
+    "deepseek/fp8",
+    "parasail/fp8",
+    "gmicloud/fp8",
+    "mancer/fp8",
 ]
-OR_MODEL = "openrouter/z-ai/glm-5.2"
-CALLBACK = "litellm_plugin_openrouter_pareto.plugin.openrouter_pareto_callback"
+COLD_START_FALLBACK = "novita/fp8"
 
 
 def _deployment(slug: str) -> str:
     return (
-        "  - model_name: z-ai/glm-5.2\n"
+        f"  - model_name: {MODEL_NAME}\n"
         "    litellm_params:\n"
-        "      model: " + OR_MODEL + "\n"
+        f"      model: {OR_MODEL}\n"
         "      api_key: os.environ/OPENROUTER_API_KEY\n"
         "      extra_body:\n"
-        "        provider: {only: [" + slug + "], zdr: true, allow_fallbacks: false, quantizations: [fp8]}\n"
+        f"        provider: {{only: [{slug}], zdr: true, allow_fallbacks: false, quantizations: [fp8]}}\n"
         "    model_info:\n"
-        "      id: or-" + slug
+        f"      id: or-{slug}"
     )
 
 
 def _rules_block(exclude_regions: list[str]) -> str:
-    if not exclude_regions:
-        return ""
-    regions = ", ".join(f'"{r}"' for r in exclude_regions)
-    return (
-        "  openrouter_pareto_rules:\n"
-        + '    "z-ai/glm-5.2":\n'
-        + "      precision: [\"fp8\"]\n"
-        + "      min_context: 1000000\n"
-        + "      min_stats_requests: 100\n"
-        + "      exclude_regions: [" + regions + "]\n"
-        + "      allow_unknown_region: false\n"
-        + "      unverified_region_policy: \"no_route\"\n"
-    )
+    lines = [
+        "  openrouter_pareto_rules:",
+        f'    "{MODEL_NAME}":',
+        '      precision: ["fp8"]',
+        "      min_context: 1000000",
+        "      min_stats_requests: 100",
+        f'      cold_start_fallback: ["{COLD_START_FALLBACK}"]',
+    ]
+    if exclude_regions:
+        regions = ", ".join(f'"{r}"' for r in exclude_regions)
+        lines += [
+            f"      exclude_regions: [{regions}]",
+            "      allow_unknown_region: false",
+            '      unverified_region_policy: "no_route"',
+        ]
+    return "\n".join(lines) + "\n"
 
 
 def render(providers: list[str], exclude_regions: list[str] | None = None) -> str:
@@ -66,7 +80,7 @@ def render(providers: list[str], exclude_regions: list[str] | None = None) -> st
         + deployments
         + "\n\n"
         + "litellm_settings:\n"
-        + "  callbacks: [\"" + CALLBACK + "\"]\n"
+        + f'  callbacks: ["{CALLBACK}"]\n'
         + "  num_retries: 3\n"
         + "  routing_strategy: simple-shuffle\n"
         + _rules_block(exclude_regions or [])

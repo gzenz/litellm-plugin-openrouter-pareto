@@ -167,6 +167,125 @@ def test_wrong_quantization_dropped() -> None:
     assert "baseten/fp8" not in sel.safe_set
 
 
+def test_max_price_drops_provider_over_ceiling() -> None:
+    """A provider whose input price per million exceeds max_price is dropped
+    before the value walk. novita (0.623/m) is the only one under 1.0, so it
+    wins outright; the pricier providers appear in neither frontier nor safe set."""
+    stats, ups = _live_fixtures()
+    r = rule(
+        precision="fp8",
+        min_context=1_000_000,
+        min_stats_requests=100,
+        max_price=1.0,
+    )
+    sel = select_candidates(stats, ups, r)
+    assert sel.winner is not None
+    assert sel.winner.slug == "novita/fp8"
+    assert set(sel.safe_set) == {"novita/fp8"}
+    assert sel.frontier == ("novita/fp8",)
+
+
+def test_max_price_at_ceiling_passes() -> None:
+    """The drop is strictly-greater-than; a provider priced exactly at the
+    ceiling survives. baseten is 1.4/m, so max_price=1.4 keeps it."""
+    stats, ups = _live_fixtures()
+    r = rule(
+        precision="fp8",
+        min_context=1_000_000,
+        min_stats_requests=100,
+        max_price=1.4,
+    )
+    sel = select_candidates(stats, ups, r)
+    assert "baseten/fp8" in sel.safe_set
+    assert sel.winner is not None
+    assert sel.winner.slug == "baseten/fp8"
+
+
+def test_max_price_none_is_no_ceiling() -> None:
+    """max_price=None (the default) keeps every provider regardless of price."""
+    stats, ups = _live_fixtures()
+    sel = select_candidates(stats, ups, _glm_rule())
+    assert set(sel.safe_set) == {
+        "novita/fp8",
+        "siliconflow/fp8",
+        "baseten/fp8",
+        "venice/fp8",
+        "z-ai/fp8",
+    }
+
+
+def test_max_price_rejects_nonpositive() -> None:
+    from pydantic import ValidationError
+
+    from litellm_plugin_openrouter_pareto.config import RuleSpec
+
+    with pytest.raises(ValueError, match="max_price"):
+        rule(precision="fp8", min_context=1_000_000, min_stats_requests=100, max_price=0)
+    with pytest.raises(ValueError, match="max_price"):
+        rule(precision="fp8", min_context=1_000_000, min_stats_requests=100, max_price=-1.5)
+    # RuleSpec (the YAML/env adapter) bounds it too.
+    with pytest.raises(ValidationError):
+        RuleSpec(max_price=0)
+
+
+def test_max_price_rejects_nonfinite() -> None:
+    """A NaN silently disables the ceiling (input_price_m > NaN is always false)
+    and infinity makes it ineffective; both are malformed operator values and
+    must be rejected on every construction path, not silently accepted."""
+    from pydantic import ValidationError
+
+    from litellm_plugin_openrouter_pareto.config import RuleSpec
+
+    for bad in (float("inf"), float("-inf"), float("nan")):
+        with pytest.raises(ValueError, match="max_price"):
+            rule(precision="fp8", min_context=1_000_000, min_stats_requests=100, max_price=bad)
+    for bad in (float("inf"), float("nan")):
+        with pytest.raises(ValidationError):
+            RuleSpec(max_price=bad)
+
+
+def test_max_price_rejects_bool_and_string() -> None:
+    """Pydantic lax mode would turn `max_price: true` into 1.0 and install a $1/M
+    ceiling from a typo, silently dropping every pricier provider. Reject bool and
+    string on every construction path; accept a real int/float."""
+    from pydantic import ValidationError
+
+    from litellm_plugin_openrouter_pareto.config import RuleSpec
+
+    # Direct construction: bool is a numeric subclass the type system permits, so
+    # Rule.__post_init__ must reject it at runtime.
+    for bad in (True, False):
+        with pytest.raises(ValueError, match="max_price"):
+            rule(precision="fp8", min_context=1_000_000, min_stats_requests=100, max_price=bad)
+    # YAML / env path (dict, untyped): bool AND string must be rejected by the
+    # before-validator, not coerced to a number.
+    for bad in (True, False, "1.5", "60"):
+        with pytest.raises(ValidationError):
+            RuleSpec.model_validate({"max_price": bad})
+    # real numeric values still pass.
+    assert rule(precision="fp8", min_context=1_000_000, min_stats_requests=100, max_price=2).max_price == 2
+    assert RuleSpec.model_validate({"max_price": 2}).max_price == 2.0
+
+
+def test_rule_fingerprint_includes_max_price() -> None:
+    """max_price changes candidate eligibility, so it must invalidate a cached
+    winner: a tighter ceiling has a different fingerprint than a looser one."""
+    from litellm_plugin_openrouter_pareto.config import rule_fingerprint
+
+    base = rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)
+    same = rule(
+        precision="fp8", min_context=1_000_000, min_stats_requests=100, max_price=2.0
+    )
+    differs = rule(
+        precision="fp8", min_context=1_000_000, min_stats_requests=100, max_price=1.0
+    )
+    assert rule_fingerprint(base) != rule_fingerprint(same)
+    assert rule_fingerprint(same) != rule_fingerprint(differs)
+    assert rule_fingerprint(base) == rule_fingerprint(
+        rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)
+    )
+
+
 def test_same_org_distinct_endpoints_both_survive_no_per_org_dedupe() -> None:
     stats = (
         _stat("baseten/fp8", 57.0, 0.0000014),

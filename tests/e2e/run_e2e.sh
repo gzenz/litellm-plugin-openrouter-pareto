@@ -3,7 +3,7 @@
 #
 # Drives the litellm-plugin-openrouter-pareto callback the way production does:
 # a live litellm proxy with the callback registered, multiple real OpenRouter
-# deployments of z-ai/glm-5.2, real API calls that cost real money. Proves the
+# deployments of deepseek/deepseek-v4-flash-0731, real API calls that cost real money. Proves the
 # real-OR wiring end-to-end: (1) the value-walk winner's provider.only reaches the
 # wire (best-effort narrowing check - the DETERMINISTIC narrowing proof, that the
 # callback returns exactly one deployment, lives in
@@ -50,7 +50,7 @@ PROXY_PORT="${PROXY_PORT:-$ALLOC_PROXY}"
 # or serve test requests, removing one TOCTOU impersonation vector.
 PROXY_URL="http://127.0.0.1:${PROXY_PORT}"
 MASTER_KEY="sk-1234"
-MODEL="z-ai/glm-5.2"
+MODEL="deepseek/deepseek-v4-flash-0731"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 CONFIG="$HERE/or_pareto_config.yaml"
@@ -216,10 +216,10 @@ chat() {
     -d "$body"
 }
 
-# A response is "served" if it parses with >=1 choice. glm-5.2 is a reasoning
-# model: with low max_tokens the assistant content can be null (tokens consumed
-# by reasoning_content), so we do NOT assert on content; the served deployment
-# slug (from the proxy log) is the real signal.
+# A response is "served" if it parses with >=1 choice. deepseek-v4-flash can be
+# a reasoning model: with low max_tokens the assistant content can be null
+# (tokens consumed by reasoning_content), so we do NOT assert on content; the
+# served deployment slug (from the proxy log) is the real signal.
 served_ok() {
   python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('choices') else 1)" 2>/dev/null
 }
@@ -263,14 +263,14 @@ SAFE_ORGS=$(python3 -c "
 import json, sys, pathlib
 p = pathlib.Path(sys.argv[1])
 d = json.loads(p.read_text())
-e = next((v for k, v in d['entries'].items() if k.split(chr(0))[0] == 'z-ai/glm-5.2'), {})
+e = next((v for k, v in d['entries'].items() if k.split(chr(0))[0] == '$MODEL'), {})
 print(' '.join(sorted({s.split('/')[0] for s in e.get('safe_set', [])})))
 " "$CACHE_JSON" 2>/dev/null || echo "")
 SAFE_SLUGS=$(python3 -c "
 import json, sys, pathlib
 p = pathlib.Path(sys.argv[1])
 d = json.loads(p.read_text())
-e = next((v for k, v in d['entries'].items() if k.split(chr(0))[0] == 'z-ai/glm-5.2'), {})
+e = next((v for k, v in d['entries'].items() if k.split(chr(0))[0] == '$MODEL'), {})
 print('\n'.join(sorted(set(e.get('safe_set', [])))))
 " "$CACHE_JSON" 2>/dev/null || echo "")
 
@@ -326,30 +326,41 @@ else
     prov=$(echo "$out" | python3 -c "import json,sys; d=json.load(sys.stdin); print((d.get('provider') or '').lower())" 2>/dev/null || echo "")
     choices=$(echo "$out" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d.get('choices',[])))" 2>/dev/null || echo "0")
     # The wire pin litellm actually forwarded, from this request's log slice. The
-    # "Final returned optional params" line is the canonical post-plugin pin.
+    # "Final returned optional params" line is the canonical post-plugin pin. A
+    # request can make several attempts (winner 429s -> litellm retries -> the
+    # plugin walks the safe set), each logging its own pin; the LAST one is the
+    # attempt that produced this response, so it is the pin to compare against
+    # response.provider. head -1 would grab the first (possibly-failed) attempt.
     wire_pin=$(tail -c "+$((LOG_OFFSET + 1))" "$PROXY_LOG" 2>/dev/null \
       | grep "Final returned optional params" \
-      | grep -o "'only': \['[^']*'\]" | head -1 | sed -E "s/.*\['([^']*)'\].*/\1/")
+      | grep -o "'only': \['[^']*'\]" | tail -1 | sed -E "s/.*\['([^']*)'\].*/\1/")
     echo "  -> provider: ${prov:-(none)} | choices: $choices | wire_pin: ${wire_pin:-(none)}"
     SERVED_PROVIDERS="$SERVED_PROVIDERS ${prov:-<none>}"
     WIRE_PINS="$WIRE_PINS ${wire_pin:-<none>}"
-    # 429 evidence scoped to just this request's log slice, and it must name the winner.
-    req_429=$(tail -c "+$((LOG_OFFSET + 1))" "$PROXY_LOG" 2>/dev/null \
-      | grep -i "429" | grep -ci "$WINNER_ORG" || true)
+    # Best-effort narrowing check. The live e2e CANNOT deterministically prove the
+    # plugin narrowed the candidate set to one deployment: the warmup routinely
+    # 429s the winner (so the winner is already hot before case 1 and is not
+    # re-attempted in-slice), input-cap can drive the walk with no 429 at all, and
+    # litellm's logs are line-coincidence rather than structured events. So a
+    # safe-set pin is accepted whenever it is the winner or a safe_set slug AND
+    # OpenRouter honored it; we do NOT claim this excludes a simple-shuffle false
+    # pass. The DETERMINISTIC narrowing proof (the callback returns exactly one
+    # deployment) lives in tests/test_plugin.py::test_narrows_to_winner_deployment.
+    # `winner_429_so_far` is a diagnostic only (shows the 429 context), not a gate.
+    winner_429_so_far=$(grep -i "429" "$PROXY_LOG" 2>/dev/null | grep -ci "$WINNER_ORG" || true)
     wire_org="${wire_pin%%/*}"
     req_ok=0
     if [ "$choices" = "0" ] || [ "$choices" = "?" ]; then
       bad "request $i returned no completion: $(echo "$out" | head -c 200)"
       REQ_FAILURES=$((REQ_FAILURES + 1))
     elif [ -z "$wire_pin" ]; then
-      bad "request $i left no wire provider.only pin in the log; cannot prove narrowing"
+      bad "request $i left no wire provider.only pin in the log; cannot prove a selection was forwarded"
       REQ_FAILURES=$((REQ_FAILURES + 1))
     elif [ "$WINNER_DEPLOYABLE" = "1" ] && [ "$wire_pin" = "$WINNER_SLUG" ]; then
       echo "     request $i pinned the winner ($WINNER_SLUG) on the wire"
       req_ok=1
-    elif [ "$WINNER_DEPLOYABLE" = "1" ] && [ "${req_429:-0}" -gt 0 ] && [ -n "$SAFE_SLUGS" ] && \
-         echo "$SAFE_SLUGS" | grep -Fqx "$wire_pin"; then
-      echo "     request $i: winner 429'd (${req_429} lines); wire pin walked to safe_set slug $wire_pin"
+    elif [ -n "$SAFE_SLUGS" ] && echo "$SAFE_SLUGS" | grep -Fqx "$wire_pin"; then
+      echo "     request $i: wire pin is safe_set slug $wire_pin (winner $WINNER_SLUG not pinned; ${winner_429_so_far} winner-429 lines in the run) - best-effort, see test_plugin.py for the deterministic proof"
       req_ok=1
     elif [ "$WINNER_DEPLOYABLE" = "0" ] && [ -n "$CONFIGURED_SLUGS" ] && [ -n "$SAFE_SLUGS" ] && \
          echo "$CONFIGURED_SLUGS" | grep -Fqx "$wire_pin" && \
@@ -360,7 +371,7 @@ else
       if [ "$WINNER_DEPLOYABLE" = "0" ]; then
         bad "request $i wire pin '$wire_pin' is not a configured safe_set slug (configured: $CONFIGURED_ORGS; safe_set: $SAFE_ORGS)"
       else
-        bad "request $i wire pin '$wire_pin' is neither the winner ($WINNER_SLUG) nor a safe_set slug after a winner 429"
+        bad "request $i wire pin '$wire_pin' is neither the winner ($WINNER_SLUG) nor a safe_set slug; the plugin did not forward a valid selection pin"
       fi
       REQ_FAILURES=$((REQ_FAILURES + 1))
     fi
@@ -394,7 +405,7 @@ else
   fi
   if [ "$REQ_FAILURES" = "0" ]; then
     if [ "$WINNER_DEPLOYABLE" = "1" ]; then
-      ok "all 3 requests pinned the value-walk winner ($WINNER_SLUG) on the wire, or walked to a safe_set slug on a winner 429 (best-effort; deterministic proof in test_plugin.py)"
+      ok "all 3 requests pinned the value-walk winner ($WINNER_SLUG) on the wire, or walked to a safe_set slug (winner 429-hot or input-capped) - best-effort, deterministic narrowing proof in test_plugin.py"
     else
       ok "winner $WINNER_ORG had no deployment; all 3 requests pinned the SAME configured safe_set slug on the wire (best-effort telemetry-driven fallback; deterministic proof in test_plugin.py)"
     fi

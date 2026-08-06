@@ -82,6 +82,8 @@ def _to_candidate(
         return None
     if input_price_m <= 0:
         return None
+    if rule.max_price is not None and input_price_m > rule.max_price:
+        return None
     return Candidate(
         slug=e.provider_slug,
         tag=e.provider_slug,

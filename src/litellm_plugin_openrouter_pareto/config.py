@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from dataclasses import dataclass
 from typing import Literal
@@ -28,6 +29,23 @@ def _normalize_regions(value: str | tuple[str, ...] | list[str]) -> tuple[str, .
     return tuple(dict.fromkeys(codes))
 
 
+def _reject_bool(v: object, *, integer: bool = False) -> object:
+    """Reject YAML/JSON bool and non-numeric coercion before pydantic lax mode
+    turns it into a real value: `max_price: true` would become 1.0 and install a
+    $1/M ceiling from a typo. `bool` is an `int` subclass, so reject it
+    explicitly. `integer=True` additionally rejects floats (e.g. a `3.0`
+    threshold); otherwise ints are accepted for float fields (3 -> 3.0)."""
+    if v is None:
+        return v
+    if integer:
+        if isinstance(v, bool) or not isinstance(v, int):
+            raise ValueError(f"must be an integer, not {type(v).__name__}")
+        return v
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise ValueError(f"must be a number, not {type(v).__name__}")
+    return v
+
+
 @dataclass(frozen=True, slots=True)
 class Rule:
     precision: tuple[str, ...]
@@ -42,6 +60,7 @@ class Rule:
     allow_unknown_region: bool = False
     unverified_region_policy: UnverifiedRegionPolicy = "no_route"
     strict_provider: bool = False
+    max_price: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "precision", _coerce_str_tuple(self.precision))
@@ -57,6 +76,12 @@ class Rule:
                 f"unverified_region_policy must be one of "
                 f"{sorted(_UNVERIFIED_REGION_POLICIES)} (got {self.unverified_region_policy!r})"
             )
+        if self.max_price is not None and isinstance(self.max_price, bool):
+            raise ValueError(f"max_price must be a number, not bool (got {self.max_price!r})")
+        if self.max_price is not None and (
+            not math.isfinite(self.max_price) or self.max_price <= 0
+        ):
+            raise ValueError(f"max_price must be a finite > 0 (got {self.max_price!r})")
 
 
 def rule(
@@ -73,6 +98,7 @@ def rule(
     allow_unknown_region: bool = False,
     unverified_region_policy: UnverifiedRegionPolicy = "no_route",
     strict_provider: bool = False,
+    max_price: float | None = None,
 ) -> Rule:
     return Rule(
         precision=_coerce_str_tuple(precision),
@@ -87,6 +113,7 @@ def rule(
         allow_unknown_region=allow_unknown_region,
         unverified_region_policy=unverified_region_policy,
         strict_provider=strict_provider,
+        max_price=max_price,
     )
 
 
@@ -104,6 +131,7 @@ class RuleSpec(BaseModel):
     allow_unknown_region: bool = False
     unverified_region_policy: UnverifiedRegionPolicy = "no_route"
     strict_provider: bool = False
+    max_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
     @field_validator("precision")
     @classmethod
@@ -114,6 +142,11 @@ class RuleSpec(BaseModel):
         elif not v:
             raise ValueError("precision must not be empty")
         return v
+
+    @field_validator("max_price", mode="before")
+    @classmethod
+    def _max_price_no_bool(cls, v: object) -> object:
+        return _reject_bool(v)
 
     def to_rule(self) -> Rule:
         return rule(
@@ -129,6 +162,7 @@ class RuleSpec(BaseModel):
             allow_unknown_region=self.allow_unknown_region,
             unverified_region_policy=self.unverified_region_policy,
             strict_provider=self.strict_provider,
+            max_price=self.max_price,
         )
 
 
@@ -147,6 +181,7 @@ def rule_fingerprint(r: Rule) -> str:
             "exclude_regions": list(r.exclude_regions),
             "allow_unknown_region": r.allow_unknown_region,
             "unverified_region_policy": r.unverified_region_policy,
+            "max_price": r.max_price,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -199,8 +234,30 @@ def telemetry_verify(cfg: TelemetryConfig | None) -> bool | str:
     return cfg.ssl_verify
 
 
+class CooldownConfig(BaseModel):
+    """Global (not per-model) cooldown tuning. Like telemetry, one cooldown store
+    serves all models, so the window / threshold / input-cap TTL are process-wide
+    properties of rate-limit handling, not per-rule selection criteria."""
+
+    model_config = {"extra": "forbid"}
+    rate_limit_window_s: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    rate_limit_threshold: int = Field(default=3, ge=1)
+    input_cap_ttl_s: float = Field(default=3600.0, gt=0, allow_inf_nan=False)
+
+    @field_validator("rate_limit_window_s", "input_cap_ttl_s", mode="before")
+    @classmethod
+    def _float_no_bool(cls, v: object) -> object:
+        return _reject_bool(v)
+
+    @field_validator("rate_limit_threshold", mode="before")
+    @classmethod
+    def _int_no_bool(cls, v: object) -> object:
+        return _reject_bool(v, integer=True)
+
+
 _RULES_ADAPTER: TypeAdapter[dict[str, RuleSpec]] = TypeAdapter(dict[str, RuleSpec])
 _TELEMETRY_ADAPTER: TypeAdapter[TelemetryConfig] = TypeAdapter(TelemetryConfig)
+_COOLDOWN_ADAPTER: TypeAdapter[CooldownConfig] = TypeAdapter(CooldownConfig)
 
 
 def load_rules_from_settings() -> dict[str, Rule] | None:
@@ -256,6 +313,33 @@ def load_telemetry_config() -> TelemetryConfig | None:
         raise RuleConfigError(f"{source} must be a mapping of telemetry fields")
     try:
         return _TELEMETRY_ADAPTER.validate_python(raw)
+    except Exception as exc:
+        raise RuleConfigError(f"invalid {source}: {exc}") from exc
+
+
+def load_cooldown_config() -> CooldownConfig | None:
+    import litellm
+
+    raw: object = getattr(litellm, "openrouter_pareto_cooldown", None)
+    source = "litellm_settings.openrouter_pareto_cooldown"
+    if raw is None:
+        env = os.environ.get("OPENROUTER_PARETO_COOLDOWN")
+        if env:
+            import json
+
+            try:
+                raw = json.loads(env)
+            except ValueError as exc:
+                raise RuleConfigError(
+                    f"OPENROUTER_PARETO_COOLDOWN is not valid JSON: {exc}"
+                ) from exc
+            source = "OPENROUTER_PARETO_COOLDOWN"
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise RuleConfigError(f"{source} must be a mapping of cooldown fields")
+    try:
+        return _COOLDOWN_ADAPTER.validate_python(raw)
     except Exception as exc:
         raise RuleConfigError(f"invalid {source}: {exc}") from exc
 

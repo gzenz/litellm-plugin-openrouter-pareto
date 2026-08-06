@@ -7,6 +7,7 @@ import pytest
 from litellm_plugin_openrouter_pareto.config import UnverifiedRegionPolicy, rule
 from litellm_plugin_openrouter_pareto.cooldown import RateLimitCooldown
 from litellm_plugin_openrouter_pareto.plugin import (
+    AllProvidersOnCooldown,
     OpenRouterParetoCallback,
     StrictProviderConflict,
     TelemetrySource,
@@ -775,14 +776,14 @@ async def test_wildcard_skips_hot_winner_injects_next() -> None:
     assert _provider_only(result[0]) == "novita"
 
 
-async def test_wildcard_all_hot_falls_back_to_winner() -> None:
+async def test_wildcard_all_hot_raises_all_providers_on_cooldown() -> None:
     cd = RateLimitCooldown(threshold=1)
     cb, _ = _callback(_entry("baseten", ("baseten", "novita")), cooldown=cd, wildcard=True)
     cd.record("z-ai/glm-5.2", "baseten")
     cd.record("z-ai/glm-5.2", "novita")
     deps = [_wildcard_dep()]
-    result = await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
-    assert _provider_only(result[0]) == "baseten"
+    with pytest.raises(AllProvidersOnCooldown, match="429 cooldown"):
+        await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
 
 
 async def test_wildcard_stale_uses_cold_start_fallback() -> None:
@@ -792,12 +793,15 @@ async def test_wildcard_stale_uses_cold_start_fallback() -> None:
     assert _provider_only(result[0]) == "novita"
 
 
-async def test_wildcard_stale_no_fallback_returns_clean_no_stale_pin() -> None:
+async def test_wildcard_stale_no_fallback_declines_no_stale_pin() -> None:
+    """Cold start with no fallback configured and no region policy: decline to
+    route rather than cede to OpenRouter (which would bypass the precision /
+    context filters). No stale pin leaks because nothing is returned."""
     cb, _ = _callback(None, wildcard=True)
     deps = [_wildcard_dep()]
     deps[0]["litellm_params"]["extra_body"] = {"provider": {"only": ["stale_pin"]}}
     result = await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
-    assert _provider_only(result[0]) is None
+    assert result == []
     assert _provider_only(deps[0]) == "stale_pin"
 
 
@@ -1171,58 +1175,59 @@ async def test_wildcard_fallback_skips_hot_first_fallback() -> None:
     assert _provider_only(result[0]) == "b/fp8"
 
 
-async def test_wildcard_fallback_all_hot_returns_stripped_constrained() -> None:
-    """All fallbacks hot (429-hot) -> _stripped_copy (constrained, no provider)."""
+async def test_wildcard_fallback_all_hot_raises_all_providers_on_cooldown() -> None:
+    """All fallbacks 429-hot -> raise AllProvidersOnCooldown (not strip/cede)."""
     cd = RateLimitCooldown(threshold=1)
     cb, _ = _callback(None, wildcard=True, cold_start_fallback=("a/fp8", "b/fp8"), cooldown=cd)
     cd.record("z-ai/glm-5.2", "a/fp8")
     cd.record("z-ai/glm-5.2", "b/fp8")
     deps = [_wildcard_dep()]
-    result = await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
-    lp = result[0]["litellm_params"]
-    assert isinstance(lp, dict)
-    eb = lp.get("extra_body")
-    assert isinstance(eb, dict)
-    provider = eb.get("provider")
-    assert isinstance(provider, dict)
-    assert "only" not in provider
-    assert provider["zdr"] is True
-    assert provider["allow_fallbacks"] is False
+    with pytest.raises(AllProvidersOnCooldown, match="429 cooldown"):
+        await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
 
 
-async def test_wildcard_fallback_first_capped_second_hot_skips_both() -> None:
-    """First capped, second hot: both are skipped by is_skipped -> _stripped_copy."""
+async def test_wildcard_fallback_first_capped_second_hot_pins_capped() -> None:
+    """First fallback input-capped (not 429-hot), second 429-hot: the capped one
+    is non-hot, so it is pinned (better to try than to fail - a small request may
+    fit under the cap). Input cap is a soft preference, not a skip."""
     cd = RateLimitCooldown(threshold=1)
     cb, _ = _callback(None, wildcard=True, cold_start_fallback=("a/fp8", "b/fp8"), cooldown=cd)
     cd.record_input_cap("z-ai/glm-5.2", "a/fp8")
     cd.record("z-ai/glm-5.2", "b/fp8")
     deps = [_wildcard_dep()]
     result = await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
-    lp = result[0]["litellm_params"]
-    assert isinstance(lp, dict)
-    eb = lp.get("extra_body")
-    assert isinstance(eb, dict)
-    provider = eb.get("provider")
-    assert isinstance(provider, dict)
-    assert "only" not in provider
-    assert provider["zdr"] is True
-    assert provider["allow_fallbacks"] is False
+    assert _provider_only(result[0]) == "a/fp8"
 
 
-async def test_wildcard_fallback_all_capped_preserves_zdr() -> None:
-    """All fallbacks input-capped -> strips only but keeps zdr and allow_fallbacks."""
+async def test_wildcard_fallback_capped_then_clean_pins_clean() -> None:
+    """Input cap is a soft preference matched to the warm path: a non-capped
+    fallback is preferred over an earlier capped one, so the clean second
+    fallback wins (not the capped first)."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(None, wildcard=True, cold_start_fallback=("a/fp8", "b/fp8"), cooldown=cd)
+    cd.record_input_cap("z-ai/glm-5.2", "a/fp8")
+    deps = [_wildcard_dep()]
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
+    assert _provider_only(result[0]) == "b/fp8"
+
+
+async def test_wildcard_fallback_all_capped_pins_better_to_try() -> None:
+    """All fallbacks input-capped (none 429-hot): pin the first non-hot fallback
+    rather than decline - a small request may still fit under the cap. Input cap
+    is a soft preference; only all-429-hot is a hard stop. zdr / no-fallback
+    posture is still forced by the pin."""
     cd = RateLimitCooldown(threshold=1)
     cb, _ = _callback(None, wildcard=True, cold_start_fallback=("a/fp8",), cooldown=cd)
     cd.record_input_cap("z-ai/glm-5.2", "a/fp8")
     deps = [_wildcard_dep()]
     result = await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
+    assert _provider_only(result[0]) == "a/fp8"
     lp = result[0]["litellm_params"]
     assert isinstance(lp, dict)
     eb = lp.get("extra_body")
     assert isinstance(eb, dict)
     provider = eb.get("provider")
     assert isinstance(provider, dict)
-    assert "only" not in provider
     assert provider["zdr"] is True
     assert provider["allow_fallbacks"] is False
 
@@ -1408,6 +1413,31 @@ async def test_all_fallbacks_region_excluded_strips_pin_under_unpinned() -> None
     cb, _ = _wildcard_region_callback(entry, unverified_region_policy="unpinned")
     result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
     assert _provider_only(result[0]) is None
+
+
+async def test_cold_start_all_eligible_hot_raises_even_if_ineligible_nonhot() -> None:
+    """An eligible-but-hot fallback plus a region-ineligible non-hot fallback must
+    raise AllProvidersOnCooldown: the ineligible provider is unusable, so it must
+    not mask every eligible provider being 429-hot (regression guard: an earlier
+    version cleared `all_hot` for any non-hot fallback before the region check)."""
+    cd = RateLimitCooldown(threshold=1)
+    entry = _entry_with_excluded(("excluded",), stale=True, allowed=("allowed", "excluded"))
+    rules = {
+        "z-ai/glm-5.2": rule(
+            precision="fp8",
+            min_context=1_000_000,
+            min_stats_requests=100,
+            wildcard=True,
+            cold_start_fallback=["allowed/fp8", "excluded/fp8"],
+            exclude_regions=["US"],
+            unverified_region_policy="no_route",
+        )
+    }
+    cb = OpenRouterParetoCallback(rules=rules, telemetry=_StubTelemetry(entry), cooldown=cd)
+    cd.record("z-ai/glm-5.2", "allowed/fp8")  # eligible, hot
+    # excluded/fp8 is non-hot but region-ineligible (base "excluded")
+    with pytest.raises(AllProvidersOnCooldown, match="429 cooldown"):
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
 
 
 def test_exclude_regions_normalizes_whitespace_case_and_duplicates() -> None:
@@ -1684,7 +1714,10 @@ async def test_trust_fallback_with_empty_list_does_not_degrade_to_unpinned() -> 
     assert result == []
 
 
-async def test_trust_fallback_all_cooled_down_does_not_degrade_to_unpinned() -> None:
+async def test_trust_fallback_all_cooled_down_raises_not_unpinned() -> None:
+    """trust_fallback means 'only the operator-vetted slugs'. With every vetted
+    slug 429-hot, raise AllProvidersOnCooldown rather than degrade to the
+    `unpinned` policy (silently ceding to OpenRouter)."""
     cd = RateLimitCooldown(threshold=1)
     rules = {
         "z-ai/glm-5.2": rule(
@@ -1699,8 +1732,8 @@ async def test_trust_fallback_all_cooled_down_does_not_degrade_to_unpinned() -> 
     }
     cb = OpenRouterParetoCallback(rules=rules, telemetry=_StubTelemetry(None), cooldown=cd)
     cd.record("z-ai/glm-5.2", "baseten/fp8")
-    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
-    assert result == []
+    with pytest.raises(AllProvidersOnCooldown, match="429 cooldown"):
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
 
 
 async def test_pinned_trust_fallback_only_trusts_configured_slugs() -> None:
@@ -2225,3 +2258,283 @@ async def test_explicit_rules_raise_on_malformed_telemetry_config() -> None:
             cb._resolve_rules()
     finally:
         _restore_litellm_attr("openrouter_pareto_telemetry", old)
+
+
+# --- AllProvidersOnCooldown: raised (not []) only on an all-429-hot list ---
+
+
+async def test_all_hot_is_value_error_subclass() -> None:
+    assert issubclass(AllProvidersOnCooldown, ValueError)
+
+
+async def test_warm_all_hot_message_names_model_winner_and_safe_set() -> None:
+    """The exception carries the plugin's own reason (not litellm's generic
+    RouterRateLimitError with an empty cooldown_list)."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        _entry("baseten", ("baseten", "novita", "siliconflow")), cooldown=cd, wildcard=True
+    )
+    for slug in ("baseten", "novita", "siliconflow"):
+        cd.record("z-ai/glm-5.2", slug)
+    with pytest.raises(AllProvidersOnCooldown) as exc_info:
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    msg = str(exc_info.value)
+    assert "z-ai/glm-5.2" in msg
+    assert "baseten" in msg
+    assert "novita" in msg
+
+
+async def test_warm_single_non_hot_in_safe_set_is_pinned_not_raised() -> None:
+    """One non-hot provider in the list is enough: it is pinned instead of raising."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        _entry("baseten", ("baseten", "novita")), cooldown=cd, wildcard=True
+    )
+    cd.record("z-ai/glm-5.2", "baseten")  # winner hot
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "novita"
+
+
+async def test_warm_all_input_capped_does_not_raise() -> None:
+    """Input cap is a soft preference: all-capped falls back to the winner, not
+    the all-429-hot raise."""
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(
+        _entry("baseten/fp8", ("baseten/fp8", "novita/fp8")), cooldown=cd, wildcard=True
+    )
+    cd.record_input_cap("z-ai/glm-5.2", "baseten/fp8")
+    cd.record_input_cap("z-ai/glm-5.2", "novita/fp8")
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "baseten/fp8"
+
+
+async def test_cold_start_all_fallbacks_hot_raises() -> None:
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        None, wildcard=True, cold_start_fallback=("a/fp8", "b/fp8"), cooldown=cd
+    )
+    cd.record("z-ai/glm-5.2", "a/fp8")
+    cd.record("z-ai/glm-5.2", "b/fp8")
+    with pytest.raises(AllProvidersOnCooldown, match="429 cooldown"):
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+
+
+async def test_cold_start_no_fallback_does_not_raise_declines() -> None:
+    """No fallback configured is not an all-429-hot state: decline ([]) instead
+    of raising."""
+    cb, _ = _callback(None, wildcard=True)
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert result == []
+
+
+# --- CooldownConfig loading + plugin resolution (mirrors telemetry config) ---
+
+
+def test_load_cooldown_config_reads_litellm_attr() -> None:
+    from litellm_plugin_openrouter_pareto.config import load_cooldown_config
+
+    old = _set_litellm_attr(
+        "openrouter_pareto_cooldown",
+        {"rate_limit_window_s": 120.0, "rate_limit_threshold": 5, "input_cap_ttl_s": 7200.0},
+    )
+    try:
+        cfg = load_cooldown_config()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_cooldown", old)
+    assert cfg is not None
+    assert cfg.rate_limit_window_s == 120.0
+    assert cfg.rate_limit_threshold == 5
+    assert cfg.input_cap_ttl_s == 7200.0
+
+
+def test_load_cooldown_config_returns_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+
+    from litellm_plugin_openrouter_pareto.config import load_cooldown_config
+
+    old = getattr(litellm, "openrouter_pareto_cooldown", None)
+    if hasattr(litellm, "openrouter_pareto_cooldown"):
+        delattr(litellm, "openrouter_pareto_cooldown")
+    monkeypatch.delenv("OPENROUTER_PARETO_COOLDOWN", raising=False)
+    try:
+        assert load_cooldown_config() is None
+    finally:
+        if old is not None:
+            setattr(  # noqa: B010  # restore
+                litellm, "openrouter_pareto_cooldown", old
+            )
+
+
+def test_load_cooldown_config_reads_env_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+
+    from litellm_plugin_openrouter_pareto.config import load_cooldown_config
+
+    old = getattr(litellm, "openrouter_pareto_cooldown", None)
+    if hasattr(litellm, "openrouter_pareto_cooldown"):
+        delattr(litellm, "openrouter_pareto_cooldown")
+    monkeypatch.setenv("OPENROUTER_PARETO_COOLDOWN", '{"rate_limit_threshold": 7}')
+    try:
+        cfg = load_cooldown_config()
+    finally:
+        if old is not None:
+            setattr(  # noqa: B010  # restore
+                litellm, "openrouter_pareto_cooldown", old
+            )
+    assert cfg is not None
+    assert cfg.rate_limit_threshold == 7
+    assert cfg.rate_limit_window_s == 300.0  # default fills the unset fields
+    assert cfg.input_cap_ttl_s == 3600.0
+
+
+def test_load_cooldown_config_raises_on_unknown_field() -> None:
+    from litellm_plugin_openrouter_pareto.config import RuleConfigError, load_cooldown_config
+
+    old = _set_litellm_attr("openrouter_pareto_cooldown", {"window_s": 120.0})
+    try:
+        with pytest.raises(RuleConfigError):
+            load_cooldown_config()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_cooldown", old)
+
+
+def test_load_cooldown_config_raises_on_non_dict() -> None:
+    from litellm_plugin_openrouter_pareto.config import RuleConfigError, load_cooldown_config
+
+    old = _set_litellm_attr("openrouter_pareto_cooldown", "not a dict")
+    try:
+        with pytest.raises(RuleConfigError):
+            load_cooldown_config()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_cooldown", old)
+
+
+def test_load_cooldown_config_raises_on_out_of_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    import litellm
+
+    from litellm_plugin_openrouter_pareto.config import RuleConfigError, load_cooldown_config
+
+    old = getattr(litellm, "openrouter_pareto_cooldown", None)
+    if hasattr(litellm, "openrouter_pareto_cooldown"):
+        delattr(litellm, "openrouter_pareto_cooldown")
+    monkeypatch.setenv("OPENROUTER_PARETO_COOLDOWN", '{"rate_limit_threshold": 0}')
+    try:
+        with pytest.raises(RuleConfigError):
+            load_cooldown_config()
+    finally:
+        if old is not None:
+            setattr(  # noqa: B010  # restore
+                litellm, "openrouter_pareto_cooldown", old
+            )
+
+
+def test_load_cooldown_config_rejects_nonfinite(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An infinite window makes recorded 429s effectively permanent and an
+    infinite input-cap TTL makes caps permanent; NaN / inf must surface as bad
+    config, not be silently accepted as a valid timer."""
+    import litellm
+
+    from litellm_plugin_openrouter_pareto.config import RuleConfigError, load_cooldown_config
+
+    for bad in ('{"rate_limit_window_s": Infinity}', '{"input_cap_ttl_s": NaN}'):
+        old = getattr(litellm, "openrouter_pareto_cooldown", None)
+        if hasattr(litellm, "openrouter_pareto_cooldown"):
+            delattr(litellm, "openrouter_pareto_cooldown")
+        monkeypatch.setenv("OPENROUTER_PARETO_COOLDOWN", bad)
+        try:
+            with pytest.raises(RuleConfigError):
+                load_cooldown_config()
+        finally:
+            if old is not None:
+                setattr(  # noqa: B010  # restore
+                    litellm, "openrouter_pareto_cooldown", old
+                )
+
+
+def test_load_cooldown_config_rejects_bool_and_string(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`rate_limit_window_s: true` would become 1.0 and `rate_limit_threshold:
+    true` would become 1, shrinking the window / threshold from a typo. Reject
+    bool and string masquerading as numbers on all cooldown fields."""
+    import litellm
+
+    from litellm_plugin_openrouter_pareto.config import RuleConfigError, load_cooldown_config
+
+    bads = [
+        '{"rate_limit_window_s": true}',
+        '{"rate_limit_threshold": false}',
+        '{"input_cap_ttl_s": "3600"}',
+        '{"rate_limit_threshold": 3.0}',
+    ]
+    for bad in bads:
+        old = getattr(litellm, "openrouter_pareto_cooldown", None)
+        if hasattr(litellm, "openrouter_pareto_cooldown"):
+            delattr(litellm, "openrouter_pareto_cooldown")
+        monkeypatch.setenv("OPENROUTER_PARETO_COOLDOWN", bad)
+        try:
+            with pytest.raises(RuleConfigError):
+                load_cooldown_config()
+        finally:
+            if old is not None:
+                setattr(  # noqa: B010  # restore
+                    litellm, "openrouter_pareto_cooldown", old
+                )
+
+
+async def test_plugin_threads_cooldown_config_into_rate_limit_cooldown() -> None:
+    """A cooldown config (with no explicit cooldown injected) rebuilds the
+    cooldown store with the configured window/threshold/ttl."""
+    old = _set_litellm_attr(
+        "openrouter_pareto_cooldown",
+        {"rate_limit_window_s": 90.0, "rate_limit_threshold": 2, "input_cap_ttl_s": 1800.0},
+    )
+    try:
+        cb = OpenRouterParetoCallback()
+        cb._resolve_rules()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_cooldown", old)
+    cd = cb._cooldown
+    assert isinstance(cd, RateLimitCooldown)
+    assert cd._window_s == 90.0
+    assert cd._threshold == 2
+    assert cd._input_cap_ttl_s == 1800.0
+
+
+async def test_plugin_keeps_default_cooldown_without_config() -> None:
+    """No cooldown config -> the __init__ default cooldown is kept, not rebuilt."""
+    import litellm
+
+    old = getattr(litellm, "openrouter_pareto_cooldown", None)
+    if hasattr(litellm, "openrouter_pareto_cooldown"):
+        delattr(litellm, "openrouter_pareto_cooldown")
+    try:
+        cb = OpenRouterParetoCallback()
+        before = cb._cooldown
+        cb._resolve_rules()
+    finally:
+        if old is not None:
+            setattr(  # noqa: B010  # restore
+                litellm, "openrouter_pareto_cooldown", old
+            )
+    assert cb._cooldown is before, "default cooldown was needlessly rebuilt"
+    assert isinstance(before, RateLimitCooldown)
+    assert before._window_s == 300.0
+    assert before._threshold == 3
+
+
+async def test_explicit_cooldown_survives_cooldown_config() -> None:
+    """An explicitly injected cooldown is never replaced by global config
+    (lazy resolution preserves injected deps - same contract as telemetry)."""
+    injected = RateLimitCooldown(window_s=42.0, threshold=9, input_cap_ttl_s=99.0)
+    old = _set_litellm_attr(
+        "openrouter_pareto_cooldown", {"rate_limit_window_s": 90.0}
+    )
+    try:
+        cb = OpenRouterParetoCallback(
+            rules={"z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)},
+            cooldown=injected,
+        )
+        cb._resolve_rules()
+    finally:
+        _restore_litellm_attr("openrouter_pareto_cooldown", old)
+    assert cb._cooldown is injected
+    assert cb._cooldown._window_s == 42.0
