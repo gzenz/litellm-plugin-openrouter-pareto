@@ -19,6 +19,11 @@ choice does not thrash.
   regions you name (best-effort, from OpenRouter's reported geography).
 - **Make routing authoritative.** Optionally reject requests that try to pin their own
   provider, so the plugin's choice cannot be overridden per request.
+- **Respect account allowed-providers.** When OpenRouter 404s with "No allowed
+  providers", the account-level allowed-providers list is parsed from the error and
+  cached; all future selection filters against it so disallowed providers are never
+  picked. Self-healing: after a configurable TTL (default 24h), one 404 re-discovers
+  any admin changes.
 
 When the plugin rewrites a route (wildcard injection, the unpinned cold-start
 fallback, or narrowing a multi-provider deployment to the winner) it also sets a
@@ -316,6 +321,29 @@ being allowed to override the plugin. Both delivery shapes are caught: a top-lev
 and a nested `extra_body.provider` (a direct SDK call). A request that sends no
 `provider.only` is routed normally.
 
+## Use case: respect account allowed-providers
+
+OpenRouter accounts have a privacy setting ("allowed providers") that restricts
+which providers the account may use. The plugin has no OpenRouter API to query this
+list proactively, it only appears in a 404 error body when a disallowed provider is
+requested. The plugin handles this automatically:
+
+1. When a request 404s with "No allowed providers are available", the plugin parses
+   the account's allowed-providers list from the error body and caches it.
+2. All future provider selection, the scorer's candidate filtering, the wildcard
+   winner injection, the cold-start fallback walk, and the pinned-mode narrowing,
+   filters against the cached allowlist, so disallowed providers are never selected.
+3. The allowlist is persisted to the telemetry cache file, so it survives proxy
+   restarts without needing a fresh 404.
+4. After the configured TTL (default 24 hours) the allowlist goes stale: filtering
+   stops, the pareto-optimal provider is tried, and if it still 404s the error
+   re-discovers the (possibly updated) allowlist for another TTL period. This means
+   at most one failed request per TTL period to detect admin changes to the
+   allowed-providers setting.
+
+No configuration is required, the feature is always on. The only knob is the TTL
+(see Allowlist tuning below).
+
 ## Configuration reference
 
 Rules come from `litellm_settings.openrouter_pareto_rules` or the
@@ -397,6 +425,28 @@ litellm_settings:
 
 The cooldown is in-process and not persisted; it resets on restart, and with multiple
 workers each worker tracks 429s independently.
+
+## Allowlist tuning
+
+The allowed-providers allowlist (discovered from 404 errors; see the use case above)
+has one global (not per-model) setting: the TTL that controls how long the cached
+list stays fresh before a new 404 probe re-discovers it. It is tunable under
+`litellm_settings.openrouter_pareto_allowlist` or the `OPENROUTER_PARETO_ALLOWLIST`
+JSON env var (unknown fields raise at first use):
+
+```yaml
+litellm_settings:
+  openrouter_pareto_allowlist:
+    ttl_s: 86400      # 24 hours; after this, one 404 re-discovers the allowlist
+```
+
+| Field | Default | Purpose |
+|---|---|---|
+| `ttl_s` | `86400` | How long the discovered allowlist is considered fresh, in seconds. After this, filtering stops and the next request probes (one 404 re-discovers for another TTL period). |
+
+The allowlist itself is persisted to the telemetry cache file, so it survives proxy
+restarts. The TTL clock starts at discovery time, not at process start, so a restart
+within the TTL window reuses the cached list without re-probing.
 
 ## How selection works
 

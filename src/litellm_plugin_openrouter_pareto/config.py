@@ -255,9 +255,24 @@ class CooldownConfig(BaseModel):
         return _reject_bool(v, integer=True)
 
 
+class AllowlistConfig(BaseModel):
+    """Global (not per-model) allowlist tuning. The allowlist is discovered from
+    OpenRouter 404 error bodies and cached; the TTL controls how long the cached
+    list is considered fresh before a new 404 probe re-discovers it."""
+
+    model_config = {"extra": "forbid"}
+    ttl_s: float = Field(default=86400.0, gt=0, allow_inf_nan=False)
+
+    @field_validator("ttl_s", mode="before")
+    @classmethod
+    def _ttl_no_bool(cls, v: object) -> object:
+        return _reject_bool(v)
+
+
 _RULES_ADAPTER: TypeAdapter[dict[str, RuleSpec]] = TypeAdapter(dict[str, RuleSpec])
 _TELEMETRY_ADAPTER: TypeAdapter[TelemetryConfig] = TypeAdapter(TelemetryConfig)
 _COOLDOWN_ADAPTER: TypeAdapter[CooldownConfig] = TypeAdapter(CooldownConfig)
+_ALLOWLIST_ADAPTER: TypeAdapter[AllowlistConfig] = TypeAdapter(AllowlistConfig)
 
 
 def load_rules_from_settings() -> dict[str, Rule] | None:
@@ -340,6 +355,33 @@ def load_cooldown_config() -> CooldownConfig | None:
         raise RuleConfigError(f"{source} must be a mapping of cooldown fields")
     try:
         return _COOLDOWN_ADAPTER.validate_python(raw)
+    except Exception as exc:
+        raise RuleConfigError(f"invalid {source}: {exc}") from exc
+
+
+def load_allowlist_config() -> AllowlistConfig | None:
+    import litellm
+
+    raw: object = getattr(litellm, "openrouter_pareto_allowlist", None)
+    source = "litellm_settings.openrouter_pareto_allowlist"
+    if raw is None:
+        env = os.environ.get("OPENROUTER_PARETO_ALLOWLIST")
+        if env:
+            import json
+
+            try:
+                raw = json.loads(env)
+            except ValueError as exc:
+                raise RuleConfigError(
+                    f"OPENROUTER_PARETO_ALLOWLIST is not valid JSON: {exc}"
+                ) from exc
+            source = "OPENROUTER_PARETO_ALLOWLIST"
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise RuleConfigError(f"{source} must be a mapping of allowlist fields")
+    try:
+        return _ALLOWLIST_ADAPTER.validate_python(raw)
     except Exception as exc:
         raise RuleConfigError(f"invalid {source}: {exc}") from exc
 

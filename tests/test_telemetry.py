@@ -944,3 +944,86 @@ def test_telemetry_config_strips_ca_cert_whitespace() -> None:
 
     cfg = TelemetryConfig(ssl_ca_cert="  /ca.pem  ")
     assert cfg.ssl_ca_cert == "/ca.pem"
+
+
+# ---------------------------------------------------------------------------
+# Allowed-providers allowlist persistence (real Telemetry class)
+# ---------------------------------------------------------------------------
+
+
+def test_allowlist_persist_then_reload_round_trip(tmp_path: Path) -> None:
+    """set_allowed_providers persists to disk; a new Telemetry loads it back."""
+    t = _telemetry(tmp_path)
+    # Set fields directly to avoid _persist_soon's async task in sync context
+    t._allowed_providers = frozenset({"z-ai", "venice", "deepinfra"})
+    t._allowed_providers_fetched_at = time.time()
+    t._persist(tuple(t._memory.items()), now=time.time())
+    reloaded = _telemetry(tmp_path)
+    reloaded._ensure_disk()
+    ap = reloaded.get_allowed_providers()
+    assert ap is not None
+    assert "z-ai" in ap
+    assert "venice" in ap
+    assert "deepinfra" in ap
+    assert "baseten" not in ap
+
+
+def test_allowlist_ttl_expiry_returns_none(tmp_path: Path) -> None:
+    """After the TTL, get_allowed_providers returns None (stale)."""
+    t = _telemetry(tmp_path, _glm_rules())
+    t._allowlist_ttl_s = 100.0
+    t._allowed_providers = frozenset({"z-ai"})
+    t._allowed_providers_fetched_at = time.time() - 200.0
+    assert t.get_allowed_providers() is None
+
+
+def test_allowlist_empty_returns_none(tmp_path: Path) -> None:
+    """An empty allowlist is treated as unknown (None), not as 'block everything'."""
+    t = _telemetry(tmp_path)
+    t._allowed_providers = frozenset()
+    t._allowed_providers_fetched_at = time.time()
+    assert t.get_allowed_providers() is None
+
+
+def test_allowlist_not_clobbered_by_worker_without_discovery(tmp_path: Path) -> None:
+    """When a worker hasn't discovered the allowlist (None), _persist preserves
+    the disk's allowlist instead of writing []."""
+    # Worker A discovers and persists the allowlist
+    t_a = _telemetry(tmp_path)
+    t_a._allowed_providers = frozenset({"z-ai", "venice"})
+    t_a._allowed_providers_fetched_at = time.time()
+    t_a._persist(tuple(t_a._memory.items()), now=time.time())
+
+    # Worker B has no allowlist (None) but persists a cache entry
+    t_b = _telemetry(tmp_path)
+    sel = _selection("baseten/fp8", ("baseten/fp8", "novita/fp8"))
+    entry = t_b._apply_promotion(None, sel, _glm_rule(), "slug", 1.0, 2.0)
+    assert entry is not None
+    t_b._memory["z-ai/glm-5.2"] = entry
+    assert t_b._allowed_providers is None  # worker B hasn't discovered
+    t_b._persist(tuple(t_b._memory.items()), now=time.time())
+
+    # Worker C loads from disk: the allowlist must survive worker B's persist
+    t_c = _telemetry(tmp_path)
+    t_c._ensure_disk()
+    ap = t_c.get_allowed_providers()
+    assert ap is not None
+    assert "z-ai" in ap
+    assert "venice" in ap
+
+
+def test_allowlist_version_mismatch_discards_old_allowlist(tmp_path: Path) -> None:
+    """A cache file with an old version does not load the allowlist."""
+    t = _telemetry(tmp_path)
+    t._allowed_providers = frozenset({"z-ai"})
+    t._allowed_providers_fetched_at = time.time()
+    t._persist(tuple(t._memory.items()), now=time.time())
+
+    # Corrupt the version
+    raw = json.loads((tmp_path / "cache.json").read_text())
+    raw["version"] = OR_CACHE_VERSION - 1
+    (tmp_path / "cache.json").write_text(json.dumps(raw))
+
+    reloaded = _telemetry(tmp_path)
+    reloaded._ensure_disk()
+    assert reloaded.get_allowed_providers() is None

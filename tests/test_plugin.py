@@ -32,10 +32,17 @@ class _StubTelemetry:
     def __init__(self, entry: CacheEntry | None) -> None:
         self.entry = entry
         self.calls: list[str] = []
+        self._allowed_providers: frozenset[str] | None = None
 
     async def get(self, model: str) -> CacheEntry | None:
         self.calls.append(model)
         return self.entry
+
+    def get_allowed_providers(self) -> frozenset[str] | None:
+        return self._allowed_providers
+
+    def set_allowed_providers(self, slugs: frozenset[str]) -> None:
+        self._allowed_providers = slugs
 
 
 def _dep(dep_id: str) -> dict[str, Any]:
@@ -61,6 +68,7 @@ def _callback(
     cooldown: RateLimitCooldown | None = None,
     wildcard: bool = False,
     cold_start_fallback: tuple[str, ...] | None = None,
+    allowed_providers: frozenset[str] | None = None,
 ) -> tuple[OpenRouterParetoCallback, _StubTelemetry]:
     rules = {
         "z-ai/glm-5.2": rule(
@@ -72,6 +80,8 @@ def _callback(
         )
     }
     stub = _StubTelemetry(entry)
+    if allowed_providers is not None:
+        stub._allowed_providers = allowed_providers
     cb = OpenRouterParetoCallback(rules=rules, telemetry=stub, cooldown=cooldown)
     return cb, stub
 
@@ -697,6 +707,12 @@ async def test_telemetry_exception_returns_unchanged() -> None:
         async def get(self, model: str) -> CacheEntry | None:
             raise RuntimeError("boom")
 
+        def get_allowed_providers(self) -> frozenset[str] | None:
+            return None
+
+        def set_allowed_providers(self, slugs: frozenset[str]) -> None:
+            pass
+
     rules = {"z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)}
     cb = OpenRouterParetoCallback(rules=rules, telemetry=_BoomTelemetry())
     healthy = _deployments()
@@ -809,6 +825,12 @@ async def test_wildcard_exception_uses_cold_start_fallback() -> None:
     class _Boom:
         async def get(self, model: str) -> CacheEntry | None:
             raise RuntimeError("boom")
+
+        def get_allowed_providers(self) -> frozenset[str] | None:
+            return None
+
+        def set_allowed_providers(self, slugs: frozenset[str]) -> None:
+            pass
 
     rules = {
         "z-ai/glm-5.2": rule(
@@ -1612,6 +1634,12 @@ async def test_pinned_telemetry_exception_applies_region_policy() -> None:
     class _Boom:
         async def get(self, model: str) -> CacheEntry | None:
             raise RuntimeError("telemetry down")
+
+        def get_allowed_providers(self) -> frozenset[str] | None:
+            return None
+
+        def set_allowed_providers(self, slugs: frozenset[str]) -> None:
+            pass
 
     rules = {
         "z-ai/glm-5.2": rule(
@@ -2538,3 +2566,159 @@ async def test_explicit_cooldown_survives_cooldown_config() -> None:
         _restore_litellm_attr("openrouter_pareto_cooldown", old)
     assert cb._cooldown is injected
     assert cb._cooldown._window_s == 42.0
+
+
+# ---------------------------------------------------------------------------
+# Allowed-providers allowlist (error-driven discovery + filtering)
+# ---------------------------------------------------------------------------
+
+_404_NO_ALLOWED_BODY = (
+    "No allowed providers are available for the selected model. "
+    "Providers serving z-ai/glm-5.2-20260616: baidu, streamlake, sail-research, "
+    "novita, digitalocean, gmicloud, deepinfra, inceptron, coreweave, decart, "
+    "akashml, alibaba, ambient, morph, phala, siliconflow, wafer, atlas-cloud, "
+    "z-ai, fireworks, cloudflare, friendli, parasail, venice, together, crusoe, "
+    "baseten, modelrun, but your account's allowed-providers setting permits "
+    "only: z-ai, azure, google-vertex, venice, mistral, together, deepinfra, "
+    "perplexity, moonshotai, digitalocean, amazon-bedrock. To change your "
+    "allowed providers, visit: https://openrouter.ai/settings/privacy. "
+    "Additionally, your request's provider.only preference permits only: "
+    "baseten/fast."
+)
+
+
+class _Exc404:
+    status_code = 404
+
+    def __str__(self) -> str:
+        return _404_NO_ALLOWED_BODY
+
+
+async def test_allowlist_filters_disallowed_winner_wildcard() -> None:
+    """In wildcard mode, the winner is skipped when its base is not in the
+    allowlist, and the next allowed safe-set slug is chosen."""
+    allowed = frozenset({"z-ai", "venice"})
+    entry = _entry("baseten/fast", ("sail-research/fp8", "venice/fp8", "z-ai/fp8", "baseten/fast"))
+    cb, _ = _callback(entry, wildcard=True, allowed_providers=allowed)
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "venice/fp8"
+
+
+async def test_allowlist_none_means_no_filtering() -> None:
+    """When the allowlist is unknown (None), no filtering is applied — the
+    pareto-optimal winner is chosen as before (backward compat)."""
+    entry = _entry("baseten/fast", ("venice/fp8", "baseten/fast"))
+    cb, _ = _callback(entry, wildcard=True, allowed_providers=None)
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "baseten/fast"
+
+
+async def test_allowlist_filters_cold_start_fallback() -> None:
+    """Cold-start fallbacks whose base is not in the allowlist are skipped."""
+    allowed = frozenset({"venice"})
+    cb, _ = _callback(
+        None, wildcard=True,
+        cold_start_fallback=("novita/fp8", "venice/fp8"),
+        allowed_providers=allowed,
+    )
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "venice/fp8"
+
+
+async def test_allowlist_all_fallbacks_disallowed_returns_empty() -> None:
+    """When every cold-start fallback is disallowed and no region policy cedes,
+    the plugin declines to route (returns [])."""
+    allowed = frozenset({"z-ai"})
+    cb, _ = _callback(
+        None, wildcard=True,
+        cold_start_fallback=("novita/fp8", "baseten/fp8"),
+        allowed_providers=allowed,
+    )
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert result == []
+
+
+async def test_allowlist_filters_narrow_mode() -> None:
+    """In non-wildcard (pinned) mode, _preferred_slugs filters by allowlist."""
+    allowed = frozenset({"venice"})
+    entry = _entry("baseten", ("baseten", "venice", "novita"))
+    cb, _ = _callback(entry, wildcard=False, allowed_providers=allowed)
+    deps = [
+        _dep("or-baseten"),
+        _dep("or-venice"),
+        _dep("or-novita"),
+    ]
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
+    assert _id_of(result[0]) == "or-venice"
+
+
+async def test_404_discovers_allowlist_from_error() -> None:
+    """A 404 'No allowed providers' error parses the allowlist from the error
+    body and stores it on the telemetry stub."""
+    cb, stub = _callback(_entry("baseten/fast", ("baseten/fast",)))
+    assert stub._allowed_providers is None
+    kwargs = _failure_kwargs("baseten/fast", _Exc404())
+    await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
+    assert stub._allowed_providers is not None
+    assert "z-ai" in stub._allowed_providers
+    assert "venice" in stub._allowed_providers
+    assert "baseten" not in stub._allowed_providers
+
+
+async def test_404_passthrough_discovers_allowlist() -> None:
+    """The passthrough failure hook also discovers the allowlist from a 404."""
+    cb, stub = _callback(_entry("baseten/fast", ("baseten/fast",)))
+    assert stub._allowed_providers is None
+    request_data = _post_call_request_data(
+        "baseten/fast",
+        response_body={"error": {"message": _404_NO_ALLOWED_BODY}},
+    )
+    await cb.async_post_call_failure_hook(request_data, _SyntheticUpstreamExc(404), None)
+    assert stub._allowed_providers is not None
+    assert "z-ai" in stub._allowed_providers
+
+
+async def test_non_404_error_does_not_discover_allowlist() -> None:
+    """A 500 error does not trigger allowlist discovery."""
+    cb, stub = _callback(_entry("baseten/fast", ("baseten/fast",)))
+
+    class _Exc500:
+        status_code = 500
+
+    kwargs = _failure_kwargs("baseten/fast", _Exc500())
+    await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
+    assert stub._allowed_providers is None
+
+
+async def test_404_without_allowed_providers_pattern_does_not_discover() -> None:
+    """A 404 that doesn't contain the 'No allowed providers' pattern does not
+    trigger allowlist discovery."""
+    cb, stub = _callback(_entry("baseten/fast", ("baseten/fast",)))
+
+    class _Exc404Other:
+        status_code = 404
+
+        def __str__(self) -> str:
+            return "Not Found"
+
+    kwargs = _failure_kwargs("baseten/fast", _Exc404Other())
+    await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
+    assert stub._allowed_providers is None
+
+
+async def test_allowlist_filters_then_404_re_discovers() -> None:
+    """When the allowlist is set, a disallowed winner is filtered. After a 404
+    re-discovers the allowlist, the next request filters against the updated
+    list."""
+    entry = _entry("baseten/fast", ("baseten/fast", "venice/fp8", "z-ai/fp8"))
+    cb, stub = _callback(entry, wildcard=True)
+    # No allowlist yet: baseten/fast is chosen
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "baseten/fast"
+    # 404 discovers the allowlist
+    kwargs = _failure_kwargs("baseten/fast", _Exc404())
+    await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
+    assert stub._allowed_providers is not None
+    # Now baseten/fast is filtered, venice/fp8 is chosen
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "venice/fp8"

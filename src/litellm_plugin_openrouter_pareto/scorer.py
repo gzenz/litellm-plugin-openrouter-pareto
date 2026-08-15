@@ -173,6 +173,7 @@ def _stage1(
     stats: tuple[StatsEndpoint, ...],
     rule: Rule,
     uptime_by_tag: Mapping[str, float],
+    allowed_providers: frozenset[str] | None = None,
 ) -> tuple[Candidate, ...]:
     excluded_bases = _excluded_bases(stats, rule)
     return tuple(
@@ -181,6 +182,10 @@ def _stage1(
             _to_candidate(e, rule, uptime_by_tag)
             for e in stats
             if _base_slug(e.provider_slug) not in excluded_bases
+            and (
+                allowed_providers is None
+                or _base_slug(e.provider_slug) in allowed_providers
+            )
         )
         if c is not None
     )
@@ -242,9 +247,10 @@ def select_candidates(
     stats_endpoints: tuple[StatsEndpoint, ...],
     uptime_endpoints: tuple[EndpointEntry, ...],
     rule: Rule,
+    allowed_providers: frozenset[str] | None = None,
 ) -> Selection:
     uptime_by_tag = _uptime_by_tag(uptime_endpoints)
-    stage1 = _stage1(stats_endpoints, rule, uptime_by_tag)
+    stage1 = _stage1(stats_endpoints, rule, uptime_by_tag, allowed_providers)
     if not stage1:
         return replace(
             _EMPTY,

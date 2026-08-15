@@ -29,7 +29,8 @@ OR_POLL_INTERVAL_S = 300.0
 OR_CANONICAL_TTL_S = 86400.0
 OR_DISK_RETENTION_S = 604800.0
 OR_COLD_START_TIMEOUT_S = 16.0
-OR_CACHE_VERSION = 4
+OR_CACHE_VERSION = 5
+DEFAULT_ALLOWLIST_TTL_S = 86400.0
 OR_BASE_URL = "https://openrouter.ai/api"
 OR_USER_AGENT = "litellm-plugin-openrouter-pareto"
 OR_TIMEOUT_S = 15.0
@@ -69,6 +70,8 @@ class _StoredCache(BaseModel):
     model_config = {"extra": "ignore"}
     version: int
     entries: dict[str, _StoredEntry] = Field(default_factory=dict[str, _StoredEntry])
+    allowed_providers: list[str] = Field(default_factory=list[str])
+    allowed_providers_fetched_at: float = 0.0
 
 
 def _entry_from_stored(s: _StoredEntry) -> CacheEntry:
@@ -111,10 +114,12 @@ class Telemetry:
         cache_dir: str | Path | None = None,
         base_url: str = OR_BASE_URL,
         verify: bool | str = True,
+        allowlist_ttl_s: float = DEFAULT_ALLOWLIST_TTL_S,
     ) -> None:
         self._rules = rules
         self._base_url = base_url.rstrip("/")
         self._verify = verify
+        self._allowlist_ttl_s = allowlist_ttl_s
         dir_path = (
             Path(cache_dir)
             if cache_dir is not None
@@ -131,6 +136,8 @@ class Telemetry:
         self._client: httpx.AsyncClient | None = None
         self._disk_loaded = False
         self._warned: set[str] = set()
+        self._allowed_providers: frozenset[str] | None = None
+        self._allowed_providers_fetched_at: float = 0.0
 
     def _ensure_disk(self) -> None:
         if self._disk_loaded:
@@ -141,20 +148,27 @@ class Telemetry:
             self._warn("disk-init", self._cache_path.name, exc)
             return
         self._memory.update(dict(self._load_disk_for_rules()))
+        self._load_allowed_providers_from_disk()
         self._disk_loaded = True
 
     def _load_disk(self) -> tuple[tuple[str, CacheEntry], ...]:
+        return tuple((k, _entry_from_stored(v)) for k, v in self._load_stored().entries.items())
+
+    def _load_stored(self) -> _StoredCache:
+        """Parse the cache file into a _StoredCache, or return an empty one on
+        error / version mismatch. Shared by _load_disk and _persist so both see
+        the same allowlist fields without re-parsing the file."""
         try:
             raw = json.loads(self._cache_path.read_text())
         except (OSError, ValueError):
-            return ()
+            return _StoredCache(version=OR_CACHE_VERSION)
         try:
             stored = _StoredCache.model_validate(raw)
         except ValueError:
-            return ()
+            return _StoredCache(version=OR_CACHE_VERSION)
         if stored.version != OR_CACHE_VERSION:
-            return ()
-        return tuple((k, _entry_from_stored(v)) for k, v in stored.entries.items())
+            return _StoredCache(version=OR_CACHE_VERSION)
+        return stored
 
     def _disk_key(self, model: str) -> str:
         """Disk identity for a model under THIS process's rule. Including the rule
@@ -170,6 +184,39 @@ class Telemetry:
         an entry written under a different policy simply does not match."""
         wanted = {self._disk_key(m): m for m in self._rules}
         return tuple((wanted[k], e) for k, e in self._load_disk() if k in wanted)
+
+    def _load_allowed_providers_from_disk(self) -> None:
+        """Restore the account-level allowed-providers allowlist from the cache file.
+        The allowlist is account-level (same for every model), but it is persisted in
+        the shared cache file so it survives restarts. A stale or absent entry leaves
+        the allowlist unknown (None), which disables filtering until a 404 re-discovers
+        it."""
+        stored = self._load_stored()
+        if stored.allowed_providers and stored.allowed_providers_fetched_at > 0:
+            self._allowed_providers = frozenset(stored.allowed_providers)
+            self._allowed_providers_fetched_at = stored.allowed_providers_fetched_at
+
+    def get_allowed_providers(self) -> frozenset[str] | None:
+        """The account-level allowed-providers set, or None when unknown/stale.
+
+        None means the allowlist is not usable for filtering: either it was never
+        discovered, or it is older than ALLOWLIST_TTL_S (24h). When None, the
+        scorer and plugin do NOT filter by allowed_providers, so the pareto-optimal
+        provider is tried. If it 404s, the error re-discovers the allowlist for
+        another 24h — at most one failed request per day to keep it fresh."""
+        if self._allowed_providers is None or not self._allowed_providers:
+            return None
+        if (time.time() - self._allowed_providers_fetched_at) >= self._allowlist_ttl_s:
+            return None
+        return self._allowed_providers
+
+    def set_allowed_providers(self, slugs: frozenset[str]) -> None:
+        """Store a freshly discovered allowlist and persist it to the cache file."""
+        if not slugs:
+            return
+        self._allowed_providers = slugs
+        self._allowed_providers_fetched_at = time.time()
+        self._persist_soon()
 
     def _supersedes(self, incoming: CacheEntry, stored: CacheEntry) -> bool:
         """Whether `incoming` represents a later state than `stored`.
@@ -203,16 +250,34 @@ class Telemetry:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
             lock = FileLock(str(self._lock_path), timeout=5)
             with lock:
-                merged = dict(self._load_disk())
+                disk_stored = self._load_stored()
+                merged = dict(
+                    (k, _entry_from_stored(v)) for k, v in disk_stored.entries.items()
+                )
                 for model, entry in snapshot:
                     key = self._disk_key(model)
                     prev = merged.get(key)
                     if prev is None or self._supersedes(entry, prev):
                         merged[key] = entry
                 pruned = self._prune_stale(merged, now)
+                # Preserve the disk's allowlist when this process hasn't discovered
+                # one yet (None): another worker may have persisted it. Keep whichever
+                # is newer by fetched_at, so a freshly discovered allowlist is not
+                # clobbered by a stale disk copy.
+                if self._allowed_providers is not None:
+                    disk_ap = frozenset(self._allowed_providers)
+                    disk_ap_at = self._allowed_providers_fetched_at
+                elif disk_stored.allowed_providers and disk_stored.allowed_providers_fetched_at > 0:
+                    disk_ap = frozenset(disk_stored.allowed_providers)
+                    disk_ap_at = disk_stored.allowed_providers_fetched_at
+                else:
+                    disk_ap = None
+                    disk_ap_at = 0.0
                 stored = _StoredCache(
                     version=OR_CACHE_VERSION,
                     entries={k: _entry_to_stored(v) for k, v in pruned.items()},
+                    allowed_providers=(list(disk_ap) if disk_ap is not None else []),
+                    allowed_providers_fetched_at=disk_ap_at,
                 )
                 tmp = self._cache_path.with_name(f".{self._cache_path.name}.{os.getpid()}.tmp")
                 tmp.write_text(stored.model_dump_json())
@@ -355,7 +420,7 @@ class Telemetry:
             self._fetch_endpoints(or_id),
             self._fetch_stats(canonical_slug or or_id),
         )
-        selection = select_candidates(stats, endpoints, rule)
+        selection = select_candidates(stats, endpoints, rule, self.get_allowed_providers())
         return self._apply_promotion(previous, selection, rule, canonical_slug, slug_fetched_at, now)
 
     def _lock_for(self, or_id: str) -> asyncio.Lock:

@@ -25,20 +25,21 @@ from pathlib import Path
 MODEL_NAME = "deepseek/deepseek-v4-flash-0731"
 OR_MODEL = "openrouter/deepseek/deepseek-v4-flash-0731"
 CALLBACK = "litellm_plugin_openrouter_pareto.plugin.openrouter_pareto_callback"
-# fp8 + >=1M context providers on OpenRouter with enough stats to score
-# (baidu/fp8 has no request stats yet, so it is omitted - it would be dropped
-# at Stage 1 and never selected). baseten/fp8 is cheapest + fastest, so it is
-# the expected value-walk winner; the rest form the safe set.
+# fp8 + >=1M context providers on OpenRouter with enough stats to score.
+# deepinfra/fp8 is in the account's allowed-providers list; the rest are not,
+# so the allowlist filter (discovered from the first 404) narrows the winner
+# to deepinfra/fp8. baseten/fp8 is cheapest + fastest and would be the value-walk
+# winner without the allowlist; the rest form the safe set.
 DEFAULT_PROVIDERS = [
+    "deepinfra/fp8",
     "novita/fp8",
     "siliconflow/fp8",
     "baseten/fp8",
-    "deepseek/fp8",
     "parasail/fp8",
     "gmicloud/fp8",
     "mancer/fp8",
 ]
-COLD_START_FALLBACK = "novita/fp8"
+COLD_START_FALLBACK = "deepinfra/fp8"
 
 
 def _deployment(slug: str) -> str:

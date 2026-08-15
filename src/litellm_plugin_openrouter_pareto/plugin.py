@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ from litellm.types.utils import AllMessageValues
 from .config import (
     DEFAULT_RULES,
     Rule,
+    load_allowlist_config,
     load_cooldown_config,
     load_rules_from_settings,
     load_telemetry_config,
@@ -18,9 +20,33 @@ from .config import (
 )
 from .cooldown import RateLimitCooldown, is_input_cap_error
 from .error_log import or_error_log
-from .telemetry import CacheEntry, Telemetry
+from .telemetry import DEFAULT_ALLOWLIST_TTL_S, CacheEntry, Telemetry
 
 _OR_PREFIX = "or-"
+
+_NO_ALLOWED_PROVIDERS_RE = re.compile(
+    r"allowed-providers setting permits only:\s*(.+?)\.\s*To change",
+    re.IGNORECASE,
+)
+
+
+def _parse_allowed_providers(message: str) -> frozenset[str] | None:
+    """Extract the account-level allowed-providers list from an OpenRouter 404
+    error body. The error message is the only place OpenRouter exposes this
+    account setting; there is no API endpoint for it. Returns None when the
+    pattern does not match (not a 'no allowed providers' 404)."""
+    m = _NO_ALLOWED_PROVIDERS_RE.search(message)
+    if m is None:
+        return None
+    raw = m.group(1)
+    slugs = frozenset(s.strip() for s in raw.split(",") if s.strip())
+    return slugs if slugs else None
+
+
+def _is_no_allowed_providers_404(status: object, message: str) -> bool:
+    """Whether a failure is an OpenRouter 404 caused by the account's
+    allowed-providers restriction blocking the selected provider.only slug."""
+    return status == 404 and "No allowed providers" in message
 
 
 def _normalize_model_group(model: str) -> str:
@@ -83,6 +109,8 @@ _RegionResult = _Routable | _Unpinned | _Decline
 @runtime_checkable
 class TelemetrySource(Protocol):
     async def get(self, model: str) -> CacheEntry | None: ...
+    def get_allowed_providers(self) -> frozenset[str] | None: ...
+    def set_allowed_providers(self, slugs: frozenset[str]) -> None: ...
 
 
 class OpenRouterParetoCallback(CustomLogger):
@@ -118,11 +146,20 @@ class OpenRouterParetoCallback(CustomLogger):
             self._rules_resolved = True
         if not self._telemetry_resolved:
             tel_config = load_telemetry_config()
+            allowlist_config = load_allowlist_config()
             # Rebuild the telemetry client only when something actually changed: a
-            # newly loaded rule set, or an explicit telemetry SSL config. With
+            # newly loaded rule set, or an explicit telemetry/allowlist config. With
             # neither, the default client built in __init__ (verify=True) is correct.
-            if rules_changed or tel_config is not None:
-                self._telemetry = Telemetry(self._rules, verify=telemetry_verify(tel_config))
+            if rules_changed or tel_config is not None or allowlist_config is not None:
+                self._telemetry = Telemetry(
+                    self._rules,
+                    verify=telemetry_verify(tel_config),
+                    allowlist_ttl_s=(
+                        allowlist_config.ttl_s
+                        if allowlist_config is not None
+                        else DEFAULT_ALLOWLIST_TTL_S
+                    ),
+                )
             self._telemetry_resolved = True
         if not self._cooldown_resolved:
             cd_config = load_cooldown_config()
@@ -241,6 +278,19 @@ class OpenRouterParetoCallback(CustomLogger):
             return None
         return self._slug_from_kwargs(request_data)
 
+    def _allowlist(self) -> frozenset[str] | None:
+        """The account-level allowed-providers set from telemetry, or None when
+        unknown/stale. When None, no filtering is applied — the pareto-optimal
+        provider is tried, and a 404 re-discovers the allowlist."""
+        return self._telemetry.get_allowed_providers()
+
+    def _allowlist_allows(self, slug: str, allowlist: frozenset[str] | None) -> bool:
+        """Whether a slug's base is permitted by the allowlist. None means the
+        allowlist is unknown/stale, so everything is permitted (filtering off)."""
+        if allowlist is None:
+            return True
+        return slug.split("/", 1)[0] in allowlist
+
     def _ordered_candidates(self, entry: CacheEntry) -> tuple[str, ...]:
         """The winner then the safe set, deduped preserving order. This is the
         ranked list the value walk produced; selection walks it to find the
@@ -249,10 +299,12 @@ class OpenRouterParetoCallback(CustomLogger):
         return tuple(dict.fromkeys(candidates))
 
     def _preferred_slugs(self, model: str, entry: CacheEntry) -> tuple[str, ...]:
+        allowlist = self._allowlist()
         return tuple(
             slug
             for slug in self._ordered_candidates(entry)
             if not self._cooldown.is_skipped(model, slug)
+            and self._allowlist_allows(slug, allowlist)
         )
 
     def _client_provider_only(self, request_kwargs: dict[str, object] | None) -> bool:
@@ -323,10 +375,12 @@ class OpenRouterParetoCallback(CustomLogger):
         # capped fall back to the first non-hot (the winner if it is not hot)
         # - a small request may still succeed under the cap, better to try than
         # to fail. Only an all-429-hot list is a hard stop.
+        allowlist = self._allowlist()
         not_hot = tuple(
             slug
             for slug in self._ordered_candidates(entry)
             if not self._cooldown.is_hot(model, slug)
+            and self._allowlist_allows(slug, allowlist)
         )
         if not not_hot:
             raise AllProvidersOnCooldown(
@@ -394,9 +448,14 @@ class OpenRouterParetoCallback(CustomLogger):
         # unusable, so it does not count toward the all-hot diagnosis (an
         # ineligible non-hot provider must not mask every eligible provider being
         # 429-hot). Only an all-429-hot ELIGIBLE fallback list is a hard stop.
+        allowlist = self._allowlist()
+        any_allowlist_disallowed = False
         eligible: list[str] = []
         any_eligible = False
         for slug in rule.cold_start_fallback:
+            if not self._allowlist_allows(slug, allowlist):
+                any_allowlist_disallowed = True
+                continue
             if not self._region_allows(model, rule, slug, entry):
                 continue
             any_eligible = True
@@ -424,10 +483,13 @@ class OpenRouterParetoCallback(CustomLogger):
         # and the precision/context filters.
         if rule.exclude_regions and rule.unverified_region_policy == "unpinned":
             return self._unpinned_result(deployments)
+        reason = "region-ineligible or none configured"
+        if any_allowlist_disallowed:
+            reason = "allowlist-disallowed, region-ineligible, or none configured"
         self._warn_once(
             f"all-hot:{model}",
             f"openrouter-pareto: no usable cold-start fallback for {model} "
-            f"(region-ineligible or none configured); declining to route. "
+            f"({reason}); declining to route. "
             f"fallback={rule.cold_start_fallback}\n",
         )
         return []
@@ -607,9 +669,11 @@ class OpenRouterParetoCallback(CustomLogger):
             match = [d for d in allowed if slug in self.slugs_of(d)]
             if match:
                 return self._pin_winner(match, slug)
-        winner_match = [d for d in allowed if entry.winner in self.slugs_of(d)]
-        if winner_match:
-            return self._pin_winner(winner_match, entry.winner)
+        allowlist = self._allowlist()
+        if self._allowlist_allows(entry.winner, allowlist):
+            winner_match = [d for d in allowed if entry.winner in self.slugs_of(d)]
+            if winner_match:
+                return self._pin_winner(winner_match, entry.winner)
         return allowed
 
     def _pin_winner(
@@ -642,6 +706,10 @@ class OpenRouterParetoCallback(CustomLogger):
         if isinstance(status, int) and status >= 400 and rule is not None and rule.log_errors:
             trimmed = message[:1000]
             or_error_log(f"model={model} slug={slug} status={status} body={trimmed}")
+        if _is_no_allowed_providers_404(status, message):
+            discovered = _parse_allowed_providers(message)
+            if discovered is not None:
+                self._telemetry.set_allowed_providers(discovered)
         if slug is None:
             return
         if status == 429:
