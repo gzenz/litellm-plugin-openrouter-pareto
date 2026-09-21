@@ -1276,6 +1276,343 @@ def test_error_log_fchmod_failure_does_not_write_body(tmp_path, monkeypatch) -> 
     assert len(calls) == 1
 
 
+def _decision_lines(log_path) -> list[str]:
+    assert log_path.exists(), "routing log was not written"
+    return [line for line in log_path.read_text().splitlines() if line]
+
+
+def _decision_callback(
+    entry: CacheEntry | None,
+    *,
+    log_decisions: bool = True,
+    cooldown: RateLimitCooldown | None = None,
+    wildcard: bool = True,
+    cold_start_fallback: tuple[str, ...] = (),
+    exclude_regions: tuple[str, ...] = (),
+    allow_unknown_region: bool = False,
+    unverified_region_policy: UnverifiedRegionPolicy = "no_route",
+) -> tuple[OpenRouterParetoCallback, _StubTelemetry]:
+    rules = {
+        "z-ai/glm-5.2": rule(
+            precision="fp8",
+            min_context=1_000_000,
+            min_stats_requests=100,
+            wildcard=wildcard,
+            cold_start_fallback=list(cold_start_fallback),
+            log_decisions=log_decisions,
+            exclude_regions=list(exclude_regions),
+            allow_unknown_region=allow_unknown_region,
+            unverified_region_policy=unverified_region_policy,
+        )
+    }
+    stub = _StubTelemetry(entry)
+    return OpenRouterParetoCallback(rules=rules, telemetry=stub, cooldown=cooldown), stub
+
+
+async def test_log_decisions_warm_wildcard_records_winner(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cb, _ = _decision_callback(_entry("baseten/fp8", ("baseten/fp8", "novita/fp8")))
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "baseten/fp8"
+    (line,) = _decision_lines(log_path)
+    assert "model=z-ai/glm-5.2" in line
+    assert "mode=wildcard" in line
+    assert "slug=baseten/fp8" in line
+    assert "decision=winner" in line
+    assert "region=-" in line
+
+
+async def test_log_decisions_warm_winner_on_cooldown_records_safe_set(tmp_path, monkeypatch) -> None:
+    """A cooldown on the winner means the next provider was walked into: safe_set."""
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _decision_callback(
+        _entry("baseten/fp8", ("baseten/fp8", "novita/fp8")), cooldown=cd
+    )
+    cd.record("z-ai/glm-5.2", "baseten/fp8")
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "novita/fp8"
+    (line,) = _decision_lines(log_path)
+    assert "slug=novita/fp8" in line
+    assert "decision=safe_set" in line
+
+
+async def test_log_decisions_all_candidates_input_capped_records_input_cap(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _decision_callback(
+        _entry("baseten/fp8", ("baseten/fp8", "novita/fp8")), cooldown=cd
+    )
+    cd.record_input_cap("z-ai/glm-5.2", "baseten/fp8")
+    cd.record_input_cap("z-ai/glm-5.2", "novita/fp8")
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "baseten/fp8"
+    (line,) = _decision_lines(log_path)
+    assert "slug=baseten/fp8" in line
+    assert "decision=input_cap" in line
+
+
+async def test_log_decisions_cold_start_records_fallback(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cb, _ = _decision_callback(None, cold_start_fallback=("novita/fp8",))
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "novita/fp8"
+    (line,) = _decision_lines(log_path)
+    assert "slug=novita/fp8" in line
+    assert "decision=cold_start" in line
+
+
+async def test_log_decisions_all_hot_written_before_the_raise(tmp_path, monkeypatch) -> None:
+    """No request ever reaches a success hook on this path, so the line has to be
+    written before AllProvidersOnCooldown is raised or the decision is invisible."""
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _decision_callback(
+        _entry("baseten/fp8", ("baseten/fp8",)), cooldown=cd
+    )
+    cd.record("z-ai/glm-5.2", "baseten/fp8")
+    with pytest.raises(AllProvidersOnCooldown):
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    (line,) = _decision_lines(log_path)
+    assert "decision=all_hot" in line
+    assert "slug=-" in line
+
+
+async def test_log_decisions_wildcard_fallback_all_hot_records_all_hot(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _decision_callback(None, cold_start_fallback=("a/fp8",), cooldown=cd)
+    cd.record("z-ai/glm-5.2", "a/fp8")
+    with pytest.raises(AllProvidersOnCooldown):
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    (line,) = _decision_lines(log_path)
+    assert "decision=all_hot" in line
+
+
+async def test_log_decisions_region_excluded_records_declined_with_verdict(tmp_path, monkeypatch) -> None:
+    """A region policy that refuses to route says so, and says the region was why."""
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    entry = _entry_with_excluded(("baseten", "novita"), stale=True)
+    cb, _ = _decision_callback(
+        entry,
+        cold_start_fallback=("baseten/fp8", "novita/fp8"),
+        exclude_regions=("US",),
+    )
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert result == []
+    (line,) = _decision_lines(log_path)
+    assert "decision=declined" in line
+    assert "region=excluded" in line
+
+
+async def test_log_decisions_unknown_region_records_verdict(tmp_path, monkeypatch) -> None:
+    """No telemetry and no trust_fallback: the fallback is unverifiable, so the
+    verdict is `unknown` rather than a claim the slug passed the policy."""
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cb, _ = _decision_callback(
+        None, cold_start_fallback=("novita/fp8",), exclude_regions=("US",)
+    )
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert result == []
+    (line,) = _decision_lines(log_path)
+    assert "decision=declined" in line
+    assert "region=unknown" in line
+
+
+async def test_log_decisions_region_allowed_records_verdict(tmp_path, monkeypatch) -> None:
+    """Telemetry has no region for this slug but allow_unknown_region admits it: a
+    real verdict was reached, so it is recorded rather than left as `-`."""
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    entry = _entry_with_excluded(("baseten",), stale=True, allowed=("novita",))
+    cb, _ = _decision_callback(
+        entry,
+        cold_start_fallback=("novita/fp8",),
+        exclude_regions=("US",),
+        allow_unknown_region=True,
+    )
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "novita/fp8"
+    (line,) = _decision_lines(log_path)
+    assert "decision=cold_start" in line
+    assert "region=allowed" in line
+
+
+async def test_log_decisions_region_policy_warn_once_still_fires(tmp_path, monkeypatch) -> None:
+    """Recording the verdict must not consume the warn-once key for that slug, or the
+    operator's stderr warning would disappear on a logging-enabled rule."""
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cb, _ = _decision_callback(None, cold_start_fallback=("novita/fp8",), exclude_regions=("US",))
+    await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert "region-unverified:z-ai/glm-5.2:novita/fp8" in cb._warned
+
+
+async def test_log_decisions_unpinned_policy_records_unpinned(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cb, _ = _decision_callback(
+        None,
+        cold_start_fallback=("novita/fp8",),
+        exclude_regions=("US",),
+        unverified_region_policy="unpinned",
+    )
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) is None
+    (line,) = _decision_lines(log_path)
+    assert "decision=unpinned" in line
+    assert "slug=-" in line
+
+
+async def test_log_decisions_pinned_warm_winner_records_pinned_mode(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cb, _ = _decision_callback(
+        _entry("baseten/fp8", ("baseten/fp8",)), wildcard=False
+    )
+    deps = [
+        {
+            "model_name": "m",
+            "litellm_params": {
+                "model": "openrouter/z-ai/glm-5.2",
+                "extra_body": {"provider": {"only": ["baseten/fp8"]}},
+            },
+            "model_info": {"id": "or-baseten/fp8"},
+        },
+        {
+            "model_name": "m",
+            "litellm_params": {
+                "model": "openrouter/z-ai/glm-5.2",
+                "extra_body": {"provider": {"only": ["novita/fp8"]}},
+            },
+            "model_info": {"id": "or-novita/fp8"},
+        },
+    ]
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
+    assert [_id_of(d) for d in result] == ["or-baseten/fp8"]
+    (line,) = _decision_lines(log_path)
+    assert "mode=pinned" in line
+    assert "slug=baseten/fp8" in line
+    assert "decision=winner" in line
+
+
+async def test_log_decisions_pinned_no_winner_records_pass_through(tmp_path, monkeypatch) -> None:
+    """No winner to narrow to: the deployment is handed back as-is, still carrying the
+    operator's own pin. That is not a plugin routing decision, and the log says so."""
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cb, _ = _decision_callback(None, wildcard=False)
+    deps = [
+        {
+            "model_name": "m",
+            "litellm_params": {
+                "model": "openrouter/z-ai/glm-5.2",
+                "extra_body": {"provider": {"only": ["baseten/fp8"]}},
+            },
+            "model_info": {"id": "or-baseten/fp8"},
+        }
+    ]
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
+    assert [_id_of(d) for d in result] == ["or-baseten/fp8"]
+    (line,) = _decision_lines(log_path)
+    assert "mode=pinned" in line
+    assert "slug=-" in line
+    assert "decision=pass_through" in line
+
+
+async def test_log_decisions_strict_conflict_records_declined(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    rules = {
+        "z-ai/glm-5.2": rule(
+            precision="fp8",
+            min_context=1_000_000,
+            min_stats_requests=100,
+            wildcard=True,
+            strict_provider=True,
+            log_decisions=True,
+        )
+    }
+    cb = OpenRouterParetoCallback(rules=rules, telemetry=_StubTelemetry(None))
+    with pytest.raises(StrictProviderConflict):
+        await cb.async_filter_deployments(
+            "z-ai/glm-5.2", [_wildcard_dep()], None, {"provider": {"only": ["baseten/fp8"]}}
+        )
+    (line,) = _decision_lines(log_path)
+    assert "decision=declined" in line
+    assert "mode=wildcard" in line
+
+
+async def test_log_decisions_off_creates_no_file(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cb, _ = _decision_callback(_entry("baseten/fp8", ("baseten/fp8",)), log_decisions=False)
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "baseten/fp8"
+    assert not log_path.exists()
+
+
+async def test_log_decisions_unmanaged_model_writes_nothing(tmp_path, monkeypatch) -> None:
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cb, _ = _decision_callback(_entry("baseten/fp8", ("baseten/fp8",)))
+    result = await cb.async_filter_deployments("unmanaged/model", [_wildcard_dep()], None)
+    assert len(result) == 1
+    assert not log_path.exists()
+
+
+async def test_decision_log_unwritable_path_still_routes(tmp_path) -> None:
+    """A logging failure must never fail a routed request."""
+    import os
+
+    log_path = tmp_path / "sub" / "routing.log"
+    os.environ["OPENROUTER_PARETO_ROUTING_LOG"] = str(log_path)
+    log_path.parent.mkdir(parents=True)
+    log_path.parent.chmod(0o555)
+    try:
+        cb, _ = _decision_callback(_entry("baseten/fp8", ("baseten/fp8",)))
+        result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+        assert _provider_only(result[0]) == "baseten/fp8"
+        assert not log_path.exists()
+    finally:
+        log_path.parent.chmod(0o755)
+        del os.environ["OPENROUTER_PARETO_ROUTING_LOG"]
+
+
+async def test_log_decisions_normalizes_model_name_to_rule_key(tmp_path, monkeypatch) -> None:
+    """The logged model is the rule key, not the client's spelling of it, so a line
+    greps the same whether Claude Code or a bare-id client sent it."""
+    log_path = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
+    cb, _ = _decision_callback(_entry("baseten/fp8", ("baseten/fp8",)))
+    await cb.async_filter_deployments(
+        "openrouter/z-ai/glm-5.2[1m]", [_wildcard_dep()], None
+    )
+    (line,) = _decision_lines(log_path)
+    assert "model=z-ai/glm-5.2 " in line
+
+
+def test_format_decision_is_single_line_with_fixed_fields() -> None:
+    from datetime import datetime, timezone
+
+    from litellm_plugin_openrouter_pareto.decision_log import Decision, format_decision
+
+    now = datetime(2026, 9, 21, 14, 2, 11, tzinfo=timezone.utc)
+    line = format_decision("z-ai/glm-5.2", "wildcard", Decision(None, "declined", None), now=now)
+    assert line == (
+        "2026-09-21T14:02:11+00:00 model=z-ai/glm-5.2 mode=wildcard "
+        "slug=- decision=declined region=-"
+    )
+
+
 async def test_stripped_copy_overrides_unsafe_zdr() -> None:
     """A deployment with zdr=False / allow_fallbacks=True gets overridden."""
     cd = RateLimitCooldown(threshold=1)

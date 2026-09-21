@@ -15,6 +15,7 @@ venv/
 tests/e2e/proxy.log
 tests/e2e/proxy_429.log
 tests/e2e/proxy_region.log
+tests/e2e/routing.log
 tests/e2e/or_pareto_config.yaml
 tests/e2e/or_429_integration_config.yaml
 tests/e2e/or_region_integration_config.yaml

@@ -63,6 +63,9 @@ def _rules_block(exclude_regions: list[str]) -> str:
         "      min_context: 1000000",
         "      min_stats_requests: 100",
         f'      cold_start_fallback: ["{COLD_START_FALLBACK}"]',
+        # The e2e greps the routing log to prove which branch chose the pin, not
+        # just that a pin reached the wire.
+        "      log_decisions: true",
     ]
     if exclude_regions:
         regions = ", ".join(f'"{r}"' for r in exclude_regions)

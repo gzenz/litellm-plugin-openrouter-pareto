@@ -56,6 +56,7 @@ class Rule:
     cold_start_fallback: tuple[str, ...]
     wildcard: bool = False
     log_errors: bool = False
+    log_decisions: bool = False
     exclude_regions: tuple[str, ...] = ()
     allow_unknown_region: bool = False
     unverified_region_policy: UnverifiedRegionPolicy = "no_route"
@@ -94,6 +95,7 @@ def rule(
     cold_start_fallback: str | tuple[str, ...] | list[str] = (),
     wildcard: bool = False,
     log_errors: bool = False,
+    log_decisions: bool = False,
     exclude_regions: str | tuple[str, ...] | list[str] = (),
     allow_unknown_region: bool = False,
     unverified_region_policy: UnverifiedRegionPolicy = "no_route",
@@ -109,6 +111,7 @@ def rule(
         cold_start_fallback=_coerce_str_tuple(cold_start_fallback),
         wildcard=wildcard,
         log_errors=log_errors,
+        log_decisions=log_decisions,
         exclude_regions=_coerce_str_tuple(exclude_regions),
         allow_unknown_region=allow_unknown_region,
         unverified_region_policy=unverified_region_policy,
@@ -127,6 +130,7 @@ class RuleSpec(BaseModel):
     cold_start_fallback: list[str] = Field(default_factory=list[str])
     wildcard: bool = False
     log_errors: bool = False
+    log_decisions: bool = False
     exclude_regions: list[str] = Field(default_factory=list[str])
     allow_unknown_region: bool = False
     unverified_region_policy: UnverifiedRegionPolicy = "no_route"
@@ -158,6 +162,7 @@ class RuleSpec(BaseModel):
             cold_start_fallback=self.cold_start_fallback,
             wildcard=self.wildcard,
             log_errors=self.log_errors,
+            log_decisions=self.log_decisions,
             exclude_regions=self.exclude_regions,
             allow_unknown_region=self.allow_unknown_region,
             unverified_region_policy=self.unverified_region_policy,
