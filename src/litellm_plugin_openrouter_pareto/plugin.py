@@ -19,7 +19,22 @@ from .config import (
     telemetry_verify,
 )
 from .cooldown import RateLimitCooldown, is_input_cap_error
-from .error_log import or_error_log
+from .decision_log import (
+    ALL_HOT,
+    COLD_START,
+    DECLINED,
+    INPUT_CAP,
+    PASS_THROUGH,
+    REGION_ALLOWED,
+    REGION_EXCLUDED,
+    REGION_UNKNOWN,
+    SAFE_SET,
+    UNPINNED,
+    WINNER,
+    Decision,
+    format_decision,
+)
+from .error_log import or_decision_log, or_error_log
 from .telemetry import DEFAULT_ALLOWLIST_TTL_S, CacheEntry, Telemetry
 
 _OR_PREFIX = "or-"
@@ -344,7 +359,10 @@ class OpenRouterParetoCallback(CustomLogger):
         rule = rules.get(model)
         if rule is None:
             return deployments
+        mode = "wildcard" if rule.wildcard else "pinned"
         if rule.strict_provider and self._client_provider_only(request_kwargs):
+            # Nothing was routed: the request is refused before any decision is taken.
+            self._log_decision(model, rule, mode, Decision(None, DECLINED, None))
             raise StrictProviderConflict(
                 f"openrouter-pareto: {model} is configured strict_provider, but the "
                 f"request carries its own extra_body.provider.only; refusing to route "
@@ -354,11 +372,28 @@ class OpenRouterParetoCallback(CustomLogger):
             entry = await self._telemetry.get(model)
         except Exception:
             if rule.wildcard:
-                return self._wildcard_fallback(model, rule, deployments)
-            return self._narrow(model, rule, None, deployments)
-        if rule.wildcard:
-            return self._inject_winner(model, rule, entry, deployments)
-        return self._narrow(model, rule, entry, deployments)
+                result, decision = self._wildcard_fallback(model, rule, deployments)
+            else:
+                result, decision = self._narrow(model, rule, None, deployments)
+        else:
+            if rule.wildcard:
+                result, decision = self._inject_winner(model, rule, entry, deployments)
+            else:
+                result, decision = self._narrow(model, rule, entry, deployments)
+        self._log_decision(model, rule, mode, decision)
+        return result
+
+    def _log_decision(self, model: str, rule: Rule, mode: str, decision: Decision) -> None:
+        """Append the decision to the routing log, gated per rule. A logging failure
+        must never fail a request: `or_decision_log` swallows its own OSErrors, and
+        the formatting is guarded too, so a surprise there cannot turn a routed
+        request into an error."""
+        if not rule.log_decisions:
+            return
+        try:
+            or_decision_log(format_decision(model, mode, decision))
+        except Exception:
+            return
 
     def _inject_winner(
         self,
@@ -366,7 +401,7 @@ class OpenRouterParetoCallback(CustomLogger):
         rule: Rule,
         entry: CacheEntry | None,
         deployments: list[dict[str, object]],
-    ) -> list[dict[str, object]]:
+    ) -> tuple[list[dict[str, object]], Decision]:
         if entry is None or entry.stale or entry.winner is None:
             return self._wildcard_fallback(model, rule, deployments, entry)
         # On 429: keep trying our own list (winner then safe set) until a
@@ -375,6 +410,8 @@ class OpenRouterParetoCallback(CustomLogger):
         # capped fall back to the first non-hot (the winner if it is not hot)
         # - a small request may still succeed under the cap, better to try than
         # to fail. Only an all-429-hot list is a hard stop.
+        # The reason records which of those two rules actually chose: a warm
+        # winner on cooldown means the safe set was walked into.
         allowlist = self._allowlist()
         not_hot = tuple(
             slug
@@ -383,6 +420,15 @@ class OpenRouterParetoCallback(CustomLogger):
             and self._allowlist_allows(slug, allowlist)
         )
         if not not_hot:
+            # Logged before the raise: the exception leaves async_filter_deployments
+            # without ever reaching the line after the dispatch, and the router
+            # re-raises it to the caller, so this is the only chance to record it.
+            self._log_decision(
+                model,
+                rule,
+                "wildcard",
+                Decision(None, ALL_HOT, self._decline_region(model, rule, entry)),
+            )
             raise AllProvidersOnCooldown(
                 f"openrouter-pareto: every provider for {model} is on a 429 "
                 f"cooldown; declining to route until one clears. "
@@ -391,8 +437,16 @@ class OpenRouterParetoCallback(CustomLogger):
         not_capped = tuple(
             slug for slug in not_hot if not self._cooldown.is_input_capped(model, slug)
         )
-        chosen = not_capped[0] if not_capped else not_hot[0]
-        return self._with_provider_only(deployments, chosen)
+        if not_capped:
+            chosen = not_capped[0]
+            reason = WINNER if chosen == entry.winner else SAFE_SET
+        else:
+            # Every non-hot provider is input-capped. The winner is preferred when
+            # it is among them (a small request may still fit under the cap).
+            chosen = entry.winner if entry.winner in not_hot else not_hot[0]
+            reason = INPUT_CAP
+        decision = Decision(chosen, reason, self._decision_region(model, rule, chosen, entry))
+        return self._with_provider_only(deployments, chosen), decision
 
     def _region_allows(self, model: str, rule: Rule, slug: str, entry: CacheEntry | None) -> bool:
         """Whether a cold-start fallback slug may be pinned under the region policy.
@@ -400,31 +454,58 @@ class OpenRouterParetoCallback(CustomLogger):
         excluded org bases. With no telemetry at all the slug is unverifiable and
         `unverified_region_policy` decides: `trust_fallback` takes the operator's word
         for configured fallbacks, anything else declines to pin it."""
+        return self._region_verdict(model, rule, slug, entry) == REGION_ALLOWED
+
+    def _region_verdict(
+        self, model: str, rule: Rule, slug: str, entry: CacheEntry | None
+    ) -> str:
+        """The region policy's verdict on one slug, for `_region_allows` and for the
+        decision log. A slug can be allowed because the rule has no region policy, or
+        because it has one and the slug passed it; only the latter is a statement about
+        region, so the caller reads the rule to tell them apart. `_region_allows` is
+        the only place the warn-once side effects belong, so this stays pure."""
         if not rule.exclude_regions:
-            return True
+            return REGION_ALLOWED
         if entry is None:
             if rule.unverified_region_policy == "trust_fallback":
-                return True
+                return REGION_ALLOWED
             self._warn_once(
                 f"region-unverified:{model}:{slug}",
                 f"openrouter-pareto: cannot verify region policy for {slug} on {model} "
                 f"(no telemetry); not pinning it under "
                 f"unverified_region_policy={rule.unverified_region_policy}\n",
             )
-            return False
+            return REGION_UNKNOWN
         base = slug.split("/", 1)[0]
         if base in entry.excluded_bases:
-            return False
+            return REGION_EXCLUDED
         if base in entry.allowed_bases:
-            return True
+            return REGION_ALLOWED
         if rule.allow_unknown_region:
-            return True
+            return REGION_ALLOWED
         self._warn_once(
             f"region-unverified:{model}:{slug}",
             f"openrouter-pareto: {slug} on {model} has no verified region "
             f"(absent from telemetry); skipping it to honor exclude_regions\n",
         )
-        return False
+        return REGION_UNKNOWN
+
+    def _decision_region(
+        self, model: str, rule: Rule, slug: str | None, entry: CacheEntry | None
+    ) -> str | None:
+        """The region verdict to record for a decision, or None when the rule has no
+        region policy at all - a verdict is only meaningful where the policy applied.
+        When it did apply, this must not re-emit the warn-once lines `_region_allows`
+        already wrote for this slug, so those are suppressed while the verdict is
+        computed."""
+        if not rule.exclude_regions or slug is None:
+            return None
+        remembered = frozenset(self._warned)
+        try:
+            verdict = self._region_verdict(model, rule, slug, entry)
+        finally:
+            self._warned = set(remembered)
+        return verdict
 
     def _warn_once(self, key: str, message: str) -> None:
         if key in self._warned:
@@ -438,7 +519,7 @@ class OpenRouterParetoCallback(CustomLogger):
         rule: Rule,
         deployments: list[dict[str, object]],
         entry: CacheEntry | None = None,
-    ) -> list[dict[str, object]]:
+    ) -> tuple[list[dict[str, object]], Decision]:
         # Cold start (no winner): walk the operator-vetted fallback list. On 429
         # keep trying until a fallback is not on cooldown. Input cap is a soft
         # preference, matched to the warm path: prefer a non-capped fallback, and
@@ -467,10 +548,17 @@ class OpenRouterParetoCallback(CustomLogger):
                 s for s in eligible if not self._cooldown.is_input_capped(model, s)
             ]
             chosen = not_capped[0] if not_capped else eligible[0]
-            return self._with_provider_only(deployments, chosen)
+            reason = COLD_START if not_capped else INPUT_CAP
+            decision = Decision(
+                chosen, reason, self._decision_region(model, rule, chosen, entry)
+            )
+            return self._with_provider_only(deployments, chosen), decision
         if any_eligible:
             # At least one fallback was region-eligible and every one of them was
             # 429-hot (none made it into `eligible`).
+            self._log_decision(
+                model, rule, "wildcard", Decision(None, ALL_HOT, None)
+            )
             raise AllProvidersOnCooldown(
                 f"openrouter-pareto: every region-eligible cold-start fallback for "
                 f"{model} is on a 429 cooldown; declining to route until one "
@@ -482,17 +570,39 @@ class OpenRouterParetoCallback(CustomLogger):
         # OpenRouter's auto-selection would bypass max_price, exclude_regions,
         # and the precision/context filters.
         if rule.exclude_regions and rule.unverified_region_policy == "unpinned":
-            return self._unpinned_result(deployments)
-        reason = "region-ineligible or none configured"
+            return self._unpinned_result(deployments), Decision(None, UNPINNED, None)
+        detail = "region-ineligible or none configured"
         if any_allowlist_disallowed:
-            reason = "allowlist-disallowed, region-ineligible, or none configured"
+            detail = "allowlist-disallowed, region-ineligible, or none configured"
         self._warn_once(
             f"all-hot:{model}",
             f"openrouter-pareto: no usable cold-start fallback for {model} "
-            f"({reason}); declining to route. "
+            f"({detail}); declining to route. "
             f"fallback={rule.cold_start_fallback}\n",
         )
-        return []
+        return [], Decision(None, DECLINED, self._decline_region(model, rule, entry))
+
+    def _decline_region(self, model: str, rule: Rule, entry: CacheEntry | None) -> str | None:
+        """Why a decision that routed nowhere was a decline, when the region policy is
+        what refused it. The verdict is read off the operator-vetted fallback list the
+        cold-start walk consumed: `excluded` means a region policy rejected otherwise
+        usable providers, and no verdict is recorded for a decline a 429 or an empty
+        fallback list caused. Suppresses warn-once, as `_decision_region` does."""
+        if not rule.exclude_regions or not rule.cold_start_fallback:
+            return None
+        remembered = frozenset(self._warned)
+        try:
+            verdicts = {
+                self._region_verdict(model, rule, slug, entry)
+                for slug in rule.cold_start_fallback
+            }
+        finally:
+            self._warned = set(remembered)
+        if verdicts == {REGION_EXCLUDED}:
+            return REGION_EXCLUDED
+        if verdicts == {REGION_UNKNOWN}:
+            return REGION_UNKNOWN
+        return None
 
     def _unpinned_result(
         self,
@@ -650,31 +760,43 @@ class OpenRouterParetoCallback(CustomLogger):
         rule: Rule,
         entry: CacheEntry | None,
         deployments: list[dict[str, object]],
-    ) -> list[dict[str, object]]:
+    ) -> tuple[list[dict[str, object]], Decision]:
         result = self._region_eligible(model, rule, entry, deployments)
         match result:
             case _Decline():
-                return []
+                return [], Decision(None, DECLINED, self._decline_region(model, rule, entry))
             case _Unpinned(deployments=unpinned):
-                return self._unpinned_result(unpinned)
+                return self._unpinned_result(unpinned), Decision(None, UNPINNED, None)
             case _Routable(deployments=allowed):
                 pass
         if entry is None or entry.stale or entry.winner is None:
             # No winner selected: hand back the region-eligible deployments as they are.
             # Each already carries the operator's own pin; the plugin does not rewrite
             # the request, so the caller's own extra_body (default mode) or the strict
-            # gate (strict mode) governs the provider, not this plugin.
-            return allowed
+            # gate (strict mode) governs the provider, not this plugin. That is the
+            # honest reading of this path, and the log says so: `pass_through`.
+            return allowed, Decision(None, PASS_THROUGH, None)
         for slug in self._preferred_slugs(model, entry):
             match = [d for d in allowed if slug in self.slugs_of(d)]
             if match:
-                return self._pin_winner(match, slug)
+                reason = WINNER if slug == entry.winner else SAFE_SET
+                decision = Decision(slug, reason, self._decision_region(model, rule, slug, entry))
+                return self._pin_winner(match, slug), decision
         allowlist = self._allowlist()
         if self._allowlist_allows(entry.winner, allowlist):
             winner_match = [d for d in allowed if entry.winner in self.slugs_of(d)]
             if winner_match:
-                return self._pin_winner(winner_match, entry.winner)
-        return allowed
+                # The preferred walk found no deployment for any preferred slug, yet the
+                # winner has one. `_preferred_slugs` already excludes the winner unless
+                # it is a hot slug the region policy admits, so say so rather than
+                # claim `winner`.
+                decision = Decision(
+                    entry.winner,
+                    SAFE_SET,
+                    self._decision_region(model, rule, entry.winner, entry),
+                )
+                return self._pin_winner(winner_match, entry.winner), decision
+        return allowed, Decision(None, PASS_THROUGH, None)
 
     def _pin_winner(
         self,

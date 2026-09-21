@@ -48,7 +48,36 @@ LITELLM_DIR="${LITELLM_DIR:-$HOME/PycharmProjects/litellm}"
 
 TEST_ROOT="$(mktemp -d)"
 export XDG_CACHE_HOME="$TEST_ROOT/cache"
-CACHE_DIR="$(python3 -c "import platformdirs; print(platformdirs.user_cache_path('litellm-plugin-openrouter-pareto'))")"
+
+# The proxy must run under the interpreter the litellm checkout is installed in,
+# because that is where the checkout (and this package, `pip install -e .` into that
+# env) is importable. Bare `python3` resolves whatever litellm is in site-packages -
+# a different release from the checkout, whose proxy/db may not even carry the
+# modules proxy_cli.py imports - and the failure surfaces as a confusing
+# ModuleNotFoundError at proxy startup. Prefer the checkout's own .venv, then
+# $VIRTUAL_ENV, then whatever python3 is on PATH. The cache-seeding step below
+# imports this package too, so it uses the same interpreter.
+LITELLM_PY="${LITELLM_PYTHON:-}"
+if [ -z "$LITELLM_PY" ]; then
+  if [ -x "$LITELLM_DIR/.venv/bin/python" ]; then
+    LITELLM_PY="$LITELLM_DIR/.venv/bin/python"
+  elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    LITELLM_PY="$VIRTUAL_ENV/bin/python"
+  elif [ -x "$LITELLM_DIR/venv/bin/python" ]; then
+    LITELLM_PY="$LITELLM_DIR/venv/bin/python"
+  else
+    LITELLM_PY="$(command -v python3)"
+  fi
+fi
+[ -x "$LITELLM_PY" ] || { echo "no usable python interpreter for the litellm checkout: $LITELLM_PY" >&2; exit 1; }
+if ! "$LITELLM_PY" -c "
+import litellm, litellm_plugin_openrouter_pareto
+" 2>/dev/null; then
+  echo "interpreter $LITELLM_PY cannot import both litellm and litellm_plugin_openrouter_pareto;" >&2
+  echo "install this package into that env (pip install -e .) or set LITELLM_PYTHON" >&2
+  exit 1
+fi
+CACHE_DIR="$("$LITELLM_PY" -c "import platformdirs; print(platformdirs.user_cache_path('litellm-plugin-openrouter-pareto'))")"
 CACHE_JSON="$CACHE_DIR/cache.json"
 
 pass=0; fail=0
@@ -77,7 +106,7 @@ require python3
 # (not stale), safe_set has novita/fp8 and baseten/fp8.
 mkdir -p "$CACHE_DIR"
 rm -f "$CACHE_JSON"
-python3 - "$CACHE_JSON" <<'PY'
+"$LITELLM_PY" - "$CACHE_JSON" <<'PY'
 import json, sys, time, pathlib
 from litellm_plugin_openrouter_pareto.config import DEFAULT_RULES, rule_fingerprint
 from litellm_plugin_openrouter_pareto.telemetry import OR_CACHE_VERSION
@@ -184,7 +213,7 @@ if curl -fs -m 2 "$PROXY_URL/health/liveliness" >/dev/null 2>&1; then
   echo "port $PROXY_PORT is already serving; refusing to run against a proxy we did not start" >&2
   exit 1
 fi
-( cd "$LITELLM_DIR" && python3 litellm/proxy/proxy_cli.py \
+( cd "$LITELLM_DIR" && "$LITELLM_PY" litellm/proxy/proxy_cli.py \
     --config "$CONFIG" --detailed_debug --port "$PROXY_PORT" ) >"$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
 for _ in $(seq 1 60); do curl -fs "$PROXY_URL/health/liveliness" >/dev/null 2>&1 && break; sleep 1; done

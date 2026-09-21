@@ -56,6 +56,12 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 CONFIG="$HERE/or_pareto_config.yaml"
 PROXY_LOG="$HERE/proxy.log"
 CACHE_JSON="$(python3 -c "import platformdirs; print(platformdirs.user_cache_path('litellm-plugin-openrouter-pareto') / 'cache.json')")"
+# The routing decision log. The seeded rule sets log_decisions: true, so every
+# managed request appends one line naming the branch that chose the slug and the
+# region verdict. Pinned to a run-scoped path so the grep cannot read a stale line
+# from a previous run, or from a production proxy sharing the default log path.
+ROUTING_LOG="$HERE/routing.log"
+export OPENROUTER_PARETO_ROUTING_LOG="$ROUTING_LOG"
 LITELLM_DIR="${LITELLM_DIR:-$HOME/PycharmProjects/litellm}"
 
 pass=0; fail=0
@@ -91,6 +97,37 @@ require() { command -v "$1" >/dev/null 2>&1 || { echo "missing: $1"; exit 1; }; 
 require curl
 require python3
 
+# The proxy must run under the interpreter the litellm checkout is installed in,
+# because that is where the checkout (and this package, `pip install -e .` into
+# that env) is importable. Bare `python3` resolves whatever litellm is in
+# site-packages - a different release from the checkout, whose proxy/db may not
+# even carry the modules proxy_cli.py imports - and the failure surfaces as a
+# confusing ModuleNotFoundError at proxy startup. Prefer the checkout's own
+# .venv, then $VIRTUAL_ENV, then whatever python3 is on PATH.
+LITELLM_PY="${LITELLM_PYTHON:-}"
+if [ -z "$LITELLM_PY" ]; then
+  if [ -x "$LITELLM_DIR/.venv/bin/python" ]; then
+    LITELLM_PY="$LITELLM_DIR/.venv/bin/python"
+  elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    LITELLM_PY="$VIRTUAL_ENV/bin/python"
+  elif [ -x "$LITELLM_DIR/venv/bin/python" ]; then
+    LITELLM_PY="$LITELLM_DIR/venv/bin/python"
+  else
+    LITELLM_PY="$(command -v python3)"
+  fi
+fi
+[ -x "$LITELLM_PY" ] || { echo "no usable python interpreter for the litellm checkout: $LITELLM_PY" >&2; exit 1; }
+# Fail here, with a legible message, rather than at proxy startup: wrong-env
+# python is the failure this probe exists to catch, and it also verifies this
+# package is importable alongside the checkout (the callback is loaded by name).
+if ! "$LITELLM_PY" -c "
+import litellm, litellm_plugin_openrouter_pareto
+" 2>/dev/null; then
+  echo "interpreter $LITELLM_PY cannot import both litellm and litellm_plugin_openrouter_pareto;" >&2
+  echo "install this package into that env (pip install -e .) or set LITELLM_PYTHON" >&2
+  exit 1
+fi
+
 if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -z "${OPENROUTER_KEY:-}" ]; then
   echo "OPENROUTER_API_KEY (or OPENROUTER_KEY) is not set; export it from your env" >&2
   exit 1
@@ -101,13 +138,14 @@ echo "e2e for litellm-plugin-openrouter-pareto (real OpenRouter)"
 echo "proxy:    $PROXY_URL  (master key $MASTER_KEY)"
 echo "cache:     $CACHE_JSON"
 echo "litellm:   $LITELLM_DIR"
+echo "python:    $LITELLM_PY"
 
 section "1. generate config"
 python3 "$HERE/gen_config.py" --out "$CONFIG" >/dev/null
 echo "config: $CONFIG"
 
 section "2. start the proxy with --detailed_debug"
-rm -f "$CACHE_JSON" "$PROXY_LOG"
+rm -f "$CACHE_JSON" "$PROXY_LOG" "$ROUTING_LOG"
 # Refuse to start if anything already holds the port. Otherwise the readiness
 # probe below can be satisfied by a stranger's proxy and every later assertion
 # measures it instead of the proxy we start here.
@@ -121,7 +159,7 @@ fi
 # master + uvicorn workers as a launch-scoped group rather than matching a
 # reusable port string that a foreign proxy could later grab.
 export OR_E2E_CONFIG="$CONFIG" OR_E2E_PORT="$PROXY_PORT"
-( cd "$LITELLM_DIR" && exec python3 -c '
+( cd "$LITELLM_DIR" && exec "$LITELLM_PY" -c '
 import os, sys
 os.setsid()
 os.execvp(sys.executable, [
@@ -412,7 +450,56 @@ else
   fi
 fi
 
-section "4. case 2 - repeat request after cache edit (NOT a stale-telemetry test)"
+section "4. routing decision log"
+echo "  log: $ROUTING_LOG"
+if [ ! -f "$ROUTING_LOG" ]; then
+  bad "no routing log was written; log_decisions is not reaching the writer"
+else
+  cat "$ROUTING_LOG"
+  # The line's `model=` field is the normalized rule key, so it matches the bare
+  # $MODEL even though the plugin strips any openrouter/ prefix and [..] tag.
+  # The mode is whatever the seeded rule is: gen_config.py does not set `wildcard`,
+  # so this run is pinned mode, and the grep must not hardcode the other one.
+  managed_lines=$(grep -cE "^[^ ]* model=$MODEL mode=(wildcard|pinned) " "$ROUTING_LOG" 2>/dev/null || true)
+  if [ "${managed_lines:-0}" -ge 4 ]; then
+    ok "$managed_lines managed requests logged (warmup + 3 in case 1)"
+  else
+    bad "expected >=4 logged managed requests, found ${managed_lines:-0}"
+  fi
+  LAST_DECISION=$(awk -v m="model=$MODEL " 'index($0, m) {d=$0} END {print d}' "$ROUTING_LOG")
+  if echo "$LAST_DECISION" | grep -qE "decision=(winner|safe_set|cold_start)"; then
+    ok "the last managed decision names a routing branch: ${LAST_DECISION#* }"
+  else
+    bad "the last managed line names no recognized branch: $LAST_DECISION"
+  fi
+  # The region verdict field is always present. With no region policy in the seeded
+  # rule (run_e2e.sh passes no --exclude-regions) the honest value is the '-'
+  # placeholder; a run that DOES seed a policy must instead carry a real verdict.
+  if grep -q "exclude_regions:" "$CONFIG"; then
+    if echo "$LAST_DECISION" | grep -qE "region=(allowed|excluded|unknown)$"; then
+      ok "the region verdict is recorded for a rule with a region policy"
+    else
+      bad "region policy set but no verdict recorded: $LAST_DECISION"
+    fi
+  elif echo "$LAST_DECISION" | grep -qE "region=-$"; then
+    ok "no region policy seeded, so no verdict is claimed (region=-)"
+  else
+    bad "no region policy seeded, but a verdict was reported anyway: $LAST_DECISION"
+  fi
+fi
+# An unmanaged model must not appear: the log is scoped to what the plugin decided.
+unmanaged_out=$(python3 -c "import json; print(json.dumps({'model':'openai/gpt-4o-mini','messages':[{'role':'user','content':'hi'}],'max_tokens':8}))")
+echo "  curl -sS -X POST $PROXY_URL/v1/chat/completions -H 'Authorization: Bearer $MASTER_KEY' -d '<unmanaged model openai/gpt-4o-mini>'"
+curl -sS -X POST "$PROXY_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $MASTER_KEY" -H "Content-Type: application/json" \
+  -d "$unmanaged_out" >/dev/null 2>&1 || true
+if grep -q "model=openai/gpt-4o-mini" "$ROUTING_LOG" 2>/dev/null; then
+  bad "an unmanaged model was logged; the log must stay scoped to plugin decisions"
+else
+  ok "an unmanaged model left no line"
+fi
+
+section "5. case 2 - repeat request after cache edit (NOT a stale-telemetry test)"
 # Deliberately NOT asserted as stale-fallback coverage. Telemetry loads cache.json once
 # per process (`_disk_loaded`), so editing the file under a running proxy does not reach
 # the in-memory entry and no refresh is forced. Even with a restart, real OR telemetry
@@ -442,6 +529,7 @@ section "summary"
 echo "  PASS=$pass FAIL=$fail"
 echo "  proxy log: $PROXY_LOG"
 echo "  cache:     $CACHE_JSON"
+echo "  routing log: $ROUTING_LOG"
 echo "  429 wiring:   see tests/e2e/run_429_integration.sh (local fixture)"
 echo "  region filter: see tests/e2e/run_region_integration.sh (local fixture; the"
 echo "                 live cold-start refresh writes the cache asynchronously, which"

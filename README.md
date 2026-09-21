@@ -366,6 +366,7 @@ sends the bare `z-ai/glm-5.2`, without a separate rule entry.
 | `value_regression_tolerance` | `0.0` | Slack that lets a pricier, faster provider win over the cheaper incumbent on the frontier. At `0.0` a move happens only when the percentage throughput gain at least matches the percentage price increase; higher values tolerate paying disproportionately more for speed. |
 | `wildcard` | `false` | `true` injects the winner per request on one deployment; `false` narrows among pinned deployments. |
 | `log_errors` | `false` | `true` appends routed `>=400` errors to `OPENROUTER_PARETO_ERROR_LOG`. |
+| `log_decisions` | `false` | `true` appends every routing decision for this model to `OPENROUTER_PARETO_ROUTING_LOG`. |
 | `exclude_regions` | `[]` | Regions to exclude by provider geography. |
 | `allow_unknown_region` | `false` | `true` keeps providers whose geography is unknown. |
 | `unverified_region_policy` | `"no_route"` | Cold-start behavior under a region policy: `no_route`, `unpinned`, or `trust_fallback`. |
@@ -377,6 +378,51 @@ sends the bare `z-ai/glm-5.2`, without a separate rule entry.
 log path: `errors.log` under the OS log directory), created owner-only (`0o600`, no
 symlink following). Error bodies may contain prompt fragments; set an explicit writable
 path in production and define retention.
+
+## Routing decision log
+
+`log_decisions: true` writes one line per routing decision for that model to
+`OPENROUTER_PARETO_ROUTING_LOG` (default a platformdirs user log path: `routing.log` in
+the same directory as `errors.log`), with the same owner-only, no-symlink-following
+writer as the error log. It records the decision and its reason, not the request
+outcome: litellm already logs outcomes, and correlating the two would need a request id
+plus a bounded in-process map for no added insight into the plugin's own behavior. What
+a decision-only log answers is the question the error log cannot - which branch chose
+this provider, and why - for a model that never left cold start, a request that landed on
+a pricier provider, or a region policy that silently dropped everything.
+
+```
+2026-09-21T14:02:11+00:00 model=z-ai/glm-5.2 mode=wildcard slug=novita/fp8 decision=safe_set region=allowed
+```
+
+| Field | Meaning |
+|---|---|
+| `model` | The rule key, after `openrouter/` prefix and `[...]` tag normalization. |
+| `mode` | `wildcard` (winner injected per request) or `pinned` (narrowed among deployments). |
+| `slug` | The provider pinned, or `-` when none was (declined, or deliberately unpinned). |
+| `decision` | The branch that chose it: `winner`, `safe_set`, `input_cap`, `cold_start`, `all_hot`, `unpinned`, `declined`, `pass_through`. |
+| `region` | The region verdict for that slug: `allowed`, `excluded`, `unknown`, or `-` when the rule has no `exclude_regions`. |
+
+The reasons are a closed set, one per terminal exit, so a branch cannot be added without
+naming how it chose:
+
+- `winner` - the value-walk winner, off cooldown and input-capped only as a preference.
+- `safe_set` - the winner was unusable (cooldown, allowlist), so the next preferred provider was taken.
+- `input_cap` - every non-hot candidate had a recorded input cap; the winner among them is still preferred (better to try than to fail).
+- `cold_start` - no usable telemetry entry, so an operator-vetted `cold_start_fallback` provider was pinned.
+- `all_hot` - every eligible provider was 429-hot; logged before `AllProvidersOnCooldown` is raised, since no request ever reaches a success hook on that path.
+- `unpinned` - `unverified_region_policy: unpinned` deliberately ceded provider choice to OpenRouter.
+- `declined` - the region policy, strict gate, or an unusable fallback list refused to route at all.
+- `pass_through` - a managed model with no winner was returned as-is, still carrying the operator's own pin.
+
+No request content is written: `model` is a model id, `slug` comes from config or
+telemetry, and `region` is derived geography - the same redaction posture as the error
+log, which is the one that does carry error bodies.
+
+Like `log_errors`, this is off by default and gated per rule, so enabling it for one
+model does not log the others. It is deliberately not part of the rule fingerprint: the
+flag cannot change candidate eligibility or winner selection, and folding it in would
+invalidate the shared selection cache for every worker that toggles logging.
 
 ## Telemetry SSL
 
