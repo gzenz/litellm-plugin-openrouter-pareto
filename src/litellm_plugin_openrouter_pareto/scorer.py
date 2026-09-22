@@ -243,6 +243,25 @@ def _value_walk(
     return reduce(advance, frontier[1:], frontier[0])
 
 
+def fallback_order(
+    winner: str | None,
+    frontier: tuple[str, ...],
+    safe_set: tuple[str, ...],
+) -> tuple[str, ...]:
+    """The order a 429 / allowlist walk should try providers in. The value walk
+    judged price-vs-throughput tradeoffs on the frontier, so the remaining frontier
+    points come first (cheapest-first, the frontier's own order); dominated safe-set
+    members are a last resort. A None winner yields just the rest; members of one
+    list that are missing from the other are never dropped."""
+    ordered = (winner,) if winner is not None else ()
+    seen = {slug for slug in ordered if slug is not None}
+    for slug in (*frontier, *safe_set):
+        if slug not in seen:
+            seen.add(slug)
+            ordered = (*ordered, slug)
+    return ordered
+
+
 def select_candidates(
     stats_endpoints: tuple[StatsEndpoint, ...],
     uptime_endpoints: tuple[EndpointEntry, ...],

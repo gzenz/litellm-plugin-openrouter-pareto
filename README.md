@@ -163,6 +163,9 @@ would bypass `max_price`, `exclude_regions`, and the precision/context filters. 
 single non-hot provider in the safe set is still pinned; only an all-429-hot list
 stops routing. Input caps never raise this - a capped provider is still tried (a
 small request may succeed under the cap), and only the 429 cooldown is a hard stop.
+The fallback walk continues the pareto walk: after the winner it tries the remaining
+pareto-frontier providers cheapest-first, and only then the dominated (off-frontier)
+safe-set members.
 
 ### Retry policy for wildcard mode
 
@@ -407,7 +410,7 @@ The reasons are a closed set, one per terminal exit, so a branch cannot be added
 naming how it chose:
 
 - `winner` - the value-walk winner, off cooldown and input-capped only as a preference.
-- `safe_set` - the winner was unusable (cooldown, allowlist), so the next preferred provider was taken.
+- `safe_set` - the winner was unusable (cooldown, allowlist), so the next preferred provider was taken (remaining frontier points first, dominated providers last).
 - `input_cap` - every non-hot candidate had a recorded input cap; the winner among them is still preferred (better to try than to fail).
 - `cold_start` - no usable telemetry entry, so an operator-vetted `cold_start_fallback` provider was pinned.
 - `all_hot` - every eligible provider was 429-hot; logged before `AllProvidersOnCooldown` is raised, since no request ever reaches a success hook on that path.
@@ -511,9 +514,10 @@ within the TTL window reuses the cached list without re-probing.
   rate-limited deployment from the healthy set, and the plugin hands back the
   winner if its slug is still among them.
 - If the winner is in 429 cooldown or not healthy, it falls back to the next
-  non-cooldown provider in the safe set (winner then cheapest-first), keeping trying
-  the list until one is not on cooldown; in wildcard mode only an all-429-hot list
-  raises.
+  non-cooldown provider in the safe set (winner, then the remaining pareto-frontier
+  points cheapest-first, then the dominated off-frontier providers as a last resort),
+  keeping trying the list until one is not on cooldown; in wildcard mode only an
+  all-429-hot list raises.
 - The telemetry cache is stored per `(model, rule)` fingerprint, so a worker configured
   with `exclude_regions` never inherits a winner computed by a worker without it, and
   two workers with different policies for the same model do not evict each other's

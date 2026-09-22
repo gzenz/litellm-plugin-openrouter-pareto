@@ -11,7 +11,7 @@ from litellm_plugin_openrouter_pareto.models import (
     StatsProviderInfo,
     StatsSample,
 )
-from litellm_plugin_openrouter_pareto.scorer import select_candidates
+from litellm_plugin_openrouter_pareto.scorer import fallback_order, select_candidates
 
 
 def _stat(
@@ -573,3 +573,48 @@ def test_partial_geography_is_routable_when_allow_unknown_region() -> None:
     ups = (_up("novita/fp8"), _up("deepinfra/fp8"))
     sel = select_candidates(stats, ups, lenient)
     assert {c.slug for c in sel.candidates} == {"novita/fp8", "deepinfra/fp8"}
+
+
+def test_fallback_order_frontier_first_dominated_last() -> None:
+    """The live fixture set: baseten wins the value walk; the remaining frontier
+    points come next cheapest-first, and the dominated same-price-slower providers
+    (venice, z-ai) are a last resort."""
+    stats, ups = _live_fixtures()
+    sel = select_candidates(stats, ups, _glm_rule())
+    assert sel.winner is not None
+    order = fallback_order(sel.winner.slug, sel.frontier, sel.safe_set)
+    assert order == ("baseten/fp8", "novita/fp8", "siliconflow/fp8", "venice/fp8", "z-ai/fp8")
+
+
+def test_fallback_order_walk_terminal_cheapest_is_winner_first() -> None:
+    """When the value-walk terminal IS the cheapest frontier point (the walk declined
+    the move: +26% throughput does not pay +91% price), it leads and the rest of the
+    frontier follows in price order."""
+    stats = (
+        _stat("novita/fp8", 23.0, 0.000000623),
+        _stat("siliconflow/fp8", 29.0, 0.00000119),
+    )
+    ups = (_up("novita/fp8"), _up("siliconflow/fp8", 99.0))
+    sel = select_candidates(stats, ups, _glm_rule())
+    assert sel.winner is not None
+    assert sel.winner.slug == "novita/fp8"
+    order = fallback_order(sel.winner.slug, sel.frontier, sel.safe_set)
+    assert order == ("novita/fp8", "siliconflow/fp8")
+
+
+def test_fallback_order_no_winner_is_rest_of_lists() -> None:
+    """A None winner yields frontier then dominated safe-set members, cheapest-first."""
+    order = fallback_order(None, ("b/fp8", "a/fp8"), ("a/fp8", "c/fp8"))
+    assert order == ("b/fp8", "a/fp8", "c/fp8")
+
+
+def test_fallback_order_empty_lists() -> None:
+    assert fallback_order(None, (), ()) == ()
+    assert fallback_order("a/fp8", (), ("a/fp8",)) == ("a/fp8",)
+
+
+def test_fallback_order_member_missing_from_other_list_is_kept() -> None:
+    """A safe_set slug absent from the frontier is still a last resort, and a frontier
+    slug absent from the safe_set is still walked - neither is dropped."""
+    order = fallback_order("w", ("f1",), ("s1", "s2"))
+    assert order == ("w", "f1", "s1", "s2")

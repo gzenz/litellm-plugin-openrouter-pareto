@@ -29,7 +29,7 @@ OR_POLL_INTERVAL_S = 300.0
 OR_CANONICAL_TTL_S = 86400.0
 OR_DISK_RETENTION_S = 604800.0
 OR_COLD_START_TIMEOUT_S = 16.0
-OR_CACHE_VERSION = 5
+OR_CACHE_VERSION = 6
 DEFAULT_ALLOWLIST_TTL_S = 86400.0
 OR_BASE_URL = "https://openrouter.ai/api"
 OR_USER_AGENT = "litellm-plugin-openrouter-pareto"
@@ -42,6 +42,7 @@ class CacheEntry:
     candidate_winner: str | None
     candidate_streak: int
     safe_set: tuple[str, ...]
+    frontier: tuple[str, ...]
     canonical_slug: str | None
     canonical_slug_fetched_at: float
     fetched_at: float
@@ -57,6 +58,7 @@ class _StoredEntry(BaseModel):
     candidate_winner: str | None = None
     candidate_streak: int = 0
     safe_set: list[str] = Field(default_factory=list[str])
+    frontier: list[str] = Field(default_factory=list[str])
     canonical_slug: str | None = None
     canonical_slug_fetched_at: float = 0.0
     fetched_at: float = 0.0
@@ -80,6 +82,7 @@ def _entry_from_stored(s: _StoredEntry) -> CacheEntry:
         candidate_winner=s.candidate_winner,
         candidate_streak=s.candidate_streak,
         safe_set=tuple(s.safe_set),
+        frontier=tuple(s.frontier),
         canonical_slug=s.canonical_slug,
         canonical_slug_fetched_at=s.canonical_slug_fetched_at,
         fetched_at=s.fetched_at,
@@ -96,6 +99,7 @@ def _entry_to_stored(e: CacheEntry) -> _StoredEntry:
         candidate_winner=e.candidate_winner,
         candidate_streak=e.candidate_streak,
         safe_set=list(e.safe_set),
+        frontier=list(e.frontier),
         canonical_slug=e.canonical_slug,
         canonical_slug_fetched_at=e.canonical_slug_fetched_at,
         fetched_at=e.fetched_at,
@@ -375,6 +379,7 @@ class Telemetry:
                     candidate_winner=None,
                     candidate_streak=0,
                     safe_set=(),
+                    frontier=(),
                     canonical_slug=canonical_slug,
                     canonical_slug_fetched_at=slug_fetched_at,
                     fetched_at=now,
@@ -402,6 +407,7 @@ class Telemetry:
             candidate_winner=selected_slug,
             candidate_streak=candidate_streak,
             safe_set=selection.safe_set,
+            frontier=selection.frontier,
             canonical_slug=canonical_slug,
             canonical_slug_fetched_at=slug_fetched_at,
             fetched_at=now,

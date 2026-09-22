@@ -280,6 +280,7 @@ def test_persist_then_reload_round_trip(tmp_path: Path) -> None:
     entry = reloaded._memory["z-ai/glm-5.2"]
     assert entry.winner == "baseten/fp8"
     assert entry.safe_set == ("baseten/fp8", "novita/fp8")
+    assert entry.frontier == ("baseten/fp8", "novita/fp8")
     assert entry.stale is False
 
 
@@ -293,6 +294,7 @@ async def test_canonical_slug_reused_within_ttl_without_fetch(tmp_path: Path) ->
         candidate_winner="novita",
         candidate_streak=1,
         safe_set=("novita",),
+        frontier=("novita",),
         canonical_slug="cached-slug",
         canonical_slug_fetched_at=now,
         fetched_at=now,

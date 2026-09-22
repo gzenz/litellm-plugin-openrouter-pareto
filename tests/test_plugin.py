@@ -15,12 +15,17 @@ from litellm_plugin_openrouter_pareto.plugin import (
 from litellm_plugin_openrouter_pareto.telemetry import CacheEntry
 
 
-def _entry(winner: str | None, safe_set: tuple[str, ...]) -> CacheEntry:
+def _entry(
+    winner: str | None,
+    safe_set: tuple[str, ...],
+    frontier: tuple[str, ...] | None = None,
+) -> CacheEntry:
     return CacheEntry(
         winner=winner,
         candidate_winner=winner,
         candidate_streak=1,
         safe_set=safe_set,
+        frontier=safe_set if frontier is None else frontier,
         canonical_slug="z-ai/glm-5.2",
         canonical_slug_fetched_at=0.0,
         fetched_at=0.0,
@@ -670,6 +675,7 @@ async def test_stale_entry_with_winner_returns_unchanged() -> None:
         candidate_winner="baseten",
         candidate_streak=3,
         safe_set=("baseten", "novita", "siliconflow"),
+        frontier=("baseten", "novita", "siliconflow"),
         canonical_slug="z-ai/glm-5.2",
         canonical_slug_fetched_at=0.0,
         fetched_at=0.0,
@@ -1703,6 +1709,7 @@ def _entry_with_excluded(
         candidate_winner="novita/fp8",
         candidate_streak=1,
         safe_set=("novita/fp8",),
+        frontier=("novita/fp8",),
         canonical_slug="z-ai/glm-5.2",
         canonical_slug_fetched_at=0.0,
         fetched_at=0.0,
@@ -1912,6 +1919,7 @@ def _region_entry(
         candidate_winner=winner,
         candidate_streak=1,
         safe_set=(winner,),
+        frontier=(winner,),
         canonical_slug="z-ai/glm-5.2",
         canonical_slug_fetched_at=0.0,
         fetched_at=0.0,
@@ -2255,6 +2263,7 @@ def _verified_entry(*, stale: bool = False, winner: str | None = "allowed/fp8") 
         candidate_winner=winner,
         candidate_streak=1,
         safe_set=("allowed/fp8",) if winner else (),
+        frontier=("allowed/fp8",) if winner else (),
         canonical_slug="z-ai/glm-5.2",
         canonical_slug_fetched_at=0.0,
         fetched_at=0.0,
@@ -3059,3 +3068,60 @@ async def test_allowlist_filters_then_404_re_discovers() -> None:
     # Now baseten/fast is filtered, venice/fp8 is chosen
     result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
     assert _provider_only(result[0]) == "venice/fp8"
+
+
+async def test_wildcard_winner_hot_walks_frontier_before_dominated() -> None:
+    """On the winner's 429 the fallback walk continues the pareto walk: remaining
+    frontier points cheapest-first come before dominated safe-set members."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        _entry(
+            "baseten/fp8",
+            ("baseten/fp8", "novita/fp8", "siliconflow/fp8", "venice/fp8", "z-ai/fp8"),
+            frontier=("baseten/fp8", "novita/fp8", "siliconflow/fp8"),
+        ),
+        cooldown=cd,
+        wildcard=True,
+    )
+    cd.record("z-ai/glm-5.2", "baseten/fp8")  # winner hot
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "novita/fp8"
+
+
+async def test_wildcard_winner_hot_and_frontier_hot_lands_on_dominated_last() -> None:
+    """Dominated safe-set members are a last resort: reached only after every
+    frontier point is hot."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        _entry(
+            "baseten/fp8",
+            ("baseten/fp8", "novita/fp8", "siliconflow/fp8", "venice/fp8", "z-ai/fp8"),
+            frontier=("baseten/fp8", "novita/fp8", "siliconflow/fp8"),
+        ),
+        cooldown=cd,
+        wildcard=True,
+    )
+    cd.record("z-ai/glm-5.2", "baseten/fp8")
+    cd.record("z-ai/glm-5.2", "novita/fp8")
+    cd.record("z-ai/glm-5.2", "siliconflow/fp8")
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "venice/fp8"
+
+
+async def test_wildcard_frontier_all_hot_with_dominated_absent_raises() -> None:
+    """Frontier-only cache (no dominated members in the safe set): the all-hot raise
+    keys off the frontier-first walk like any other."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        _entry(
+            "baseten/fp8",
+            ("baseten/fp8", "novita/fp8"),
+            frontier=("baseten/fp8", "novita/fp8"),
+        ),
+        cooldown=cd,
+        wildcard=True,
+    )
+    cd.record("z-ai/glm-5.2", "baseten/fp8")
+    cd.record("z-ai/glm-5.2", "novita/fp8")
+    with pytest.raises(AllProvidersOnCooldown):
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)

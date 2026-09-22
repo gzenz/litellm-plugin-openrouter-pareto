@@ -35,6 +35,7 @@ from .decision_log import (
     format_decision,
 )
 from .error_log import or_decision_log, or_error_log
+from .scorer import fallback_order
 from .telemetry import DEFAULT_ALLOWLIST_TTL_S, CacheEntry, Telemetry
 
 _OR_PREFIX = "or-"
@@ -307,11 +308,12 @@ class OpenRouterParetoCallback(CustomLogger):
         return slug.split("/", 1)[0] in allowlist
 
     def _ordered_candidates(self, entry: CacheEntry) -> tuple[str, ...]:
-        """The winner then the safe set, deduped preserving order. This is the
-        ranked list the value walk produced; selection walks it to find the
-        first provider that is usable right now."""
-        candidates = (entry.winner, *entry.safe_set) if entry.winner is not None else entry.safe_set
-        return tuple(dict.fromkeys(candidates))
+        """The value walk's order: winner, then the remaining pareto frontier points
+        cheapest-first, then dominated safe-set members as a last resort. This is the
+        ranked list selection walks to find the first provider that is usable right
+        now; an entry without a cached frontier (older cache, failed refresh)
+        degrades to winner + cheapest-first safe set."""
+        return fallback_order(entry.winner, entry.frontier, entry.safe_set)
 
     def _preferred_slugs(self, model: str, entry: CacheEntry) -> tuple[str, ...]:
         allowlist = self._allowlist()
