@@ -11,7 +11,12 @@ from litellm_plugin_openrouter_pareto.models import (
     StatsProviderInfo,
     StatsSample,
 )
-from litellm_plugin_openrouter_pareto.scorer import fallback_order, select_candidates
+from litellm_plugin_openrouter_pareto.scorer import (
+    Point,
+    _sanitized,
+    ranked_order,
+    select_candidates,
+)
 
 
 def _stat(
@@ -575,21 +580,21 @@ def test_partial_geography_is_routable_when_allow_unknown_region() -> None:
     assert {c.slug for c in sel.candidates} == {"novita/fp8", "deepinfra/fp8"}
 
 
-def test_fallback_order_frontier_first_dominated_last() -> None:
-    """The live fixture set: baseten wins the value walk; the remaining frontier
-    points come next cheapest-first, and the dominated same-price-slower providers
-    (venice, z-ai) are a last resort."""
+def test_ranked_order_live_fixture_walk_order() -> None:
+    """The live fixture set: baseten wins, then novita (52% cheaper than siliconflow
+    for 21% less throughput - the re-run walk declines the move), then venice (once
+    novita is gone, venice's +38% throughput over siliconflow pays for +18% price),
+    with the cheapest-and-slowest dominated provider (z-ai) last."""
     stats, ups = _live_fixtures()
     sel = select_candidates(stats, ups, _glm_rule())
     assert sel.winner is not None
-    order = fallback_order(sel.winner.slug, sel.frontier, sel.safe_set)
-    assert order == ("baseten/fp8", "novita/fp8", "siliconflow/fp8", "venice/fp8", "z-ai/fp8")
+    order = ranked_order(sel.points, _glm_rule().value_regression_tolerance)
+    assert order == ("baseten/fp8", "novita/fp8", "venice/fp8", "siliconflow/fp8", "z-ai/fp8")
 
 
-def test_fallback_order_walk_terminal_cheapest_is_winner_first() -> None:
+def test_ranked_order_walk_terminal_cheapest_is_first() -> None:
     """When the value-walk terminal IS the cheapest frontier point (the walk declined
-    the move: +26% throughput does not pay +91% price), it leads and the rest of the
-    frontier follows in price order."""
+    the move: +26% throughput does not pay +91% price), it leads the order."""
     stats = (
         _stat("novita/fp8", 23.0, 0.000000623),
         _stat("siliconflow/fp8", 29.0, 0.00000119),
@@ -598,23 +603,121 @@ def test_fallback_order_walk_terminal_cheapest_is_winner_first() -> None:
     sel = select_candidates(stats, ups, _glm_rule())
     assert sel.winner is not None
     assert sel.winner.slug == "novita/fp8"
-    order = fallback_order(sel.winner.slug, sel.frontier, sel.safe_set)
+    order = ranked_order(sel.points, _glm_rule().value_regression_tolerance)
     assert order == ("novita/fp8", "siliconflow/fp8")
 
 
-def test_fallback_order_no_winner_is_rest_of_lists() -> None:
-    """A None winner yields frontier then dominated safe-set members, cheapest-first."""
-    order = fallback_order(None, ("b/fp8", "a/fp8"), ("a/fp8", "c/fp8"))
-    assert order == ("b/fp8", "a/fp8", "c/fp8")
+def test_ranked_order_dominated_by_excluded_winner_takes_over() -> None:
+    """The option-b behavior: fireworks is dominated by coreweave, so the FULL-set
+    walk's first pick is coreweave, but elimination removes coreweave from the set
+    before the second pick - and the re-run walk then promotes fireworks first
+    (+57% price for +230% throughput over deepinfra), ahead of every cheaper
+    provider. This is exactly what a 429 on the winner should fall back to."""
+    points = tuple(
+        Point(slug=s, input_price_m=p, tps=t)
+        for s, p, t in [
+            ("morph", 0.120, 6.0),
+            ("relace/fp4", 0.130, 24.0),
+            ("deepinfra/fp8", 0.140, 43.0),
+            ("coreweave/fp8", 0.200, 193.0),
+            ("fireworks", 0.220, 142.0),
+        ]
+    )
+    full = ranked_order(points, 0.0)
+    assert full[0] == "coreweave/fp8"
+    assert full[1] == "fireworks"
+    without_winner = ranked_order(points, 0.0, exclude=frozenset({"coreweave/fp8"}))
+    assert without_winner[0] == "fireworks"
+    assert without_winner[1] == "deepinfra/fp8"
 
 
-def test_fallback_order_empty_lists() -> None:
-    assert fallback_order(None, (), ()) == ()
-    assert fallback_order("a/fp8", (), ("a/fp8",)) == ("a/fp8",)
+def test_ranked_order_empty_points() -> None:
+    assert ranked_order((), 0.0) == ()
+    assert ranked_order((), 0.5, exclude=frozenset({"a"})) == ()
 
 
-def test_fallback_order_member_missing_from_other_list_is_kept() -> None:
-    """A safe_set slug absent from the frontier is still a last resort, and a frontier
-    slug absent from the safe_set is still walked - neither is dropped."""
-    order = fallback_order("w", ("f1",), ("s1", "s2"))
-    assert order == ("w", "f1", "s1", "s2")
+def test_ranked_order_exclude_all_yields_empty() -> None:
+    points = (Point(slug="a/fp8", input_price_m=1.0, tps=10.0),)
+    assert ranked_order(points, 0.0, exclude=frozenset({"a/fp8"})) == ()
+
+
+def test_ranked_order_drops_non_finite_points() -> None:
+    """A point the walk cannot order is dropped rather than left to make the sort
+    non-transitive: a non-finite coordinate has no defined position, so keeping it
+    would make the result depend on input order. Selection and the cache both screen
+    these upstream; this is the guard for a hand-built tuple."""
+    nan = float("nan")
+    points = (
+        Point(slug="morph", input_price_m=0.12, tps=6.0),
+        Point(slug="nanprice", input_price_m=nan, tps=500.0),
+        Point(slug="baseten", input_price_m=0.20, tps=193.0),
+        Point(slug="infprice", input_price_m=float("inf"), tps=900.0),
+        Point(slug="nantps", input_price_m=0.13, tps=nan),
+    )
+    order = ranked_order(points, 0.0)
+    assert "nanprice" not in order
+    assert "infprice" not in order
+    assert "nantps" not in order
+    assert order == ("baseten", "morph")
+
+
+def test_ranked_order_non_finite_dropped_regardless_of_input_order() -> None:
+    """The point of screening: the answer no longer depends on where the bad point
+    sat in the tuple. Before screening, a NaN price at max tps collapsed the frontier
+    to itself and a NaN price at low tps was selected last - same input, different
+    answer, decided by tuple position."""
+    nan = float("nan")
+    base = [Point(slug="a", input_price_m=0.10, tps=10.0),
+            Point(slug="b", input_price_m=0.30, tps=50.0)]
+    bad = Point(slug="nan", input_price_m=nan, tps=500.0)
+    assert ranked_order(tuple([bad, *base]), 0.0) == ranked_order(tuple([*base, bad]), 0.0)
+    assert ranked_order(tuple([bad, *base]), 0.0) == ranked_order(tuple(base), 0.0)
+
+
+def test_ranked_order_collapses_duplicate_slugs_to_the_fastest() -> None:
+    """A duplicate slug must not silently drop the other point; the faster one wins,
+    matching `_dedupe_by_slug` at selection time."""
+    order = ranked_order(
+        (
+            Point(slug="dup", input_price_m=0.1, tps=10.0),
+            Point(slug="dup", input_price_m=0.2, tps=20.0),
+        ),
+        0.0,
+    )
+    assert order == ("dup",)
+
+
+def test_ranked_order_exclude_re_walks_instead_of_filtering_the_order() -> None:
+    """The fallback must re-run the walk over available points, not filter a full-set
+    order: `c` is only justified by the `e` stepping stone, so with `e` unavailable the
+    walk over what remains picks `a`, while filtering the full order would have left
+    `c` first - a provider the available-set walk rejects."""
+    points = (
+        Point(slug="a", input_price_m=1.0, tps=10.0),
+        Point(slug="e", input_price_m=1.4, tps=13.1),
+        Point(slug="c", input_price_m=1.96, tps=17.16),
+    )
+    assert ranked_order(points, 0.1) == ("c", "e", "a")
+    assert ranked_order(points, 0.1, exclude=frozenset({"e"})) == ("a", "c")
+
+
+def test_ranked_order_drops_non_positive_tps() -> None:
+    """A zero throughput is a division denominator in `_walk_points`, so it must be
+    screened like a zero price: keeping it raises ZeroDivisionError on the request
+    path when the point becomes the walk incumbent."""
+    points = (
+        Point(slug="zero", input_price_m=0.1, tps=0.0),
+        Point(slug="neg", input_price_m=0.2, tps=-5.0),
+        Point(slug="b", input_price_m=0.3, tps=50.0),
+    )
+    assert ranked_order(points, 0.0) == ("b",)
+
+
+def test_ranked_order_duplicate_tie_breaks_on_cheaper_price() -> None:
+    """At equal throughput the cheaper point survives, matching `_dedupe_by_slug` at
+    selection time - otherwise the collapsed choice would depend on input order, which
+    is the position-dependence this screening exists to remove."""
+    cheap = Point(slug="dup", input_price_m=0.15, tps=20.0)
+    dear = Point(slug="dup", input_price_m=0.20, tps=20.0)
+    assert _sanitized((dear, cheap)) == (cheap,)
+    assert _sanitized((cheap, dear)) == (cheap,)

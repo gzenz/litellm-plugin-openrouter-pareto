@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import ssl
 import sys
@@ -13,7 +14,7 @@ from pathlib import Path
 import httpx
 import platformdirs
 from filelock import FileLock, Timeout
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .config import Rule, rule_fingerprint
 from .models import (
@@ -23,13 +24,13 @@ from .models import (
     StatsEndpoint,
     StatsResponse,
 )
-from .scorer import Selection, select_candidates
+from .scorer import Point, Selection, select_candidates
 
 OR_POLL_INTERVAL_S = 300.0
 OR_CANONICAL_TTL_S = 86400.0
 OR_DISK_RETENTION_S = 604800.0
 OR_COLD_START_TIMEOUT_S = 16.0
-OR_CACHE_VERSION = 6
+OR_CACHE_VERSION = 7
 DEFAULT_ALLOWLIST_TTL_S = 86400.0
 OR_BASE_URL = "https://openrouter.ai/api"
 OR_USER_AGENT = "litellm-plugin-openrouter-pareto"
@@ -42,14 +43,40 @@ class CacheEntry:
     candidate_winner: str | None
     candidate_streak: int
     safe_set: tuple[str, ...]
-    frontier: tuple[str, ...]
     canonical_slug: str | None
     canonical_slug_fetched_at: float
     fetched_at: float
     stale: bool
     rule_fp: str = ""
+    points: tuple[Point, ...] = ()
     excluded_bases: tuple[str, ...] = ()
     allowed_bases: tuple[str, ...] = ()
+
+
+def _usable(p: _StoredPoint) -> bool:
+    """Whether a cached point's coordinates are ones the walk can order and divide by.
+    Both are division denominators downstream, and a non-finite one also leaves the
+    tier sort non-transitive."""
+    return (
+        math.isfinite(p.input_price_m)
+        and math.isfinite(p.tps)
+        and p.input_price_m > 0
+        and p.tps > 0
+    )
+
+
+class _StoredPoint(BaseModel):
+    """A cached scored point. Coordinates are NOT validated here: a bad one is dropped
+    from its entry's list at load (see `_StoredEntry.points`), so a single corrupt
+    coordinate costs one point rather than the whole cache file. Validating here would
+    reject the entire `_StoredCache`, losing every healthy entry and the persisted
+    allowlist with them. `ranked_order` screens the same conditions again, which is
+    what bare in-process tuples rely on."""
+
+    model_config = {"extra": "ignore"}
+    slug: str
+    input_price_m: float
+    tps: float
 
 
 class _StoredEntry(BaseModel):
@@ -58,7 +85,17 @@ class _StoredEntry(BaseModel):
     candidate_winner: str | None = None
     candidate_streak: int = 0
     safe_set: list[str] = Field(default_factory=list[str])
-    frontier: list[str] = Field(default_factory=list[str])
+    points: list[_StoredPoint] = Field(default_factory=list[_StoredPoint])
+
+    @field_validator("points")
+    @classmethod
+    def _drop_unusable(cls, v: list[_StoredPoint]) -> list[_StoredPoint]:
+        """Drop points the walk cannot order, rather than rejecting the entry. A
+        corrupt coordinate is a per-point problem, and failing the whole model here
+        would discard every healthy entry in the file along with the persisted
+        allowlist; a missing point costs only a fallback candidate."""
+        return [p for p in v if _usable(p)]
+
     canonical_slug: str | None = None
     canonical_slug_fetched_at: float = 0.0
     fetched_at: float = 0.0
@@ -82,7 +119,7 @@ def _entry_from_stored(s: _StoredEntry) -> CacheEntry:
         candidate_winner=s.candidate_winner,
         candidate_streak=s.candidate_streak,
         safe_set=tuple(s.safe_set),
-        frontier=tuple(s.frontier),
+        points=tuple(Point(slug=p.slug, input_price_m=p.input_price_m, tps=p.tps) for p in s.points),
         canonical_slug=s.canonical_slug,
         canonical_slug_fetched_at=s.canonical_slug_fetched_at,
         fetched_at=s.fetched_at,
@@ -99,7 +136,10 @@ def _entry_to_stored(e: CacheEntry) -> _StoredEntry:
         candidate_winner=e.candidate_winner,
         candidate_streak=e.candidate_streak,
         safe_set=list(e.safe_set),
-        frontier=list(e.frontier),
+        points=[
+            _StoredPoint(slug=p.slug, input_price_m=p.input_price_m, tps=p.tps)
+            for p in e.points
+        ],
         canonical_slug=e.canonical_slug,
         canonical_slug_fetched_at=e.canonical_slug_fetched_at,
         fetched_at=e.fetched_at,
@@ -379,7 +419,7 @@ class Telemetry:
                     candidate_winner=None,
                     candidate_streak=0,
                     safe_set=(),
-                    frontier=(),
+                    points=(),
                     canonical_slug=canonical_slug,
                     canonical_slug_fetched_at=slug_fetched_at,
                     fetched_at=now,
@@ -407,7 +447,7 @@ class Telemetry:
             candidate_winner=selected_slug,
             candidate_streak=candidate_streak,
             safe_set=selection.safe_set,
-            frontier=selection.frontier,
+            points=selection.points,
             canonical_slug=canonical_slug,
             canonical_slug_fetched_at=slug_fetched_at,
             fetched_at=now,

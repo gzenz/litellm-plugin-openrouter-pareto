@@ -12,20 +12,33 @@ from litellm_plugin_openrouter_pareto.plugin import (
     StrictProviderConflict,
     TelemetrySource,
 )
+from litellm_plugin_openrouter_pareto.scorer import Point
 from litellm_plugin_openrouter_pareto.telemetry import CacheEntry
 
 
 def _entry(
     winner: str | None,
     safe_set: tuple[str, ...],
-    frontier: tuple[str, ...] | None = None,
+    points: tuple[Point, ...] | None = None,
 ) -> CacheEntry:
+    """A warm entry. `points` defaults to a set where the winner dominates (cheapest
+    AND fastest), so the re-run walk ranks it first and the rest cheapest-first -
+    the legacy behavior; tests that exercise the re-walk pass real points."""
     return CacheEntry(
         winner=winner,
         candidate_winner=winner,
         candidate_streak=1,
         safe_set=safe_set,
-        frontier=safe_set if frontier is None else frontier,
+        points=points
+        if points is not None
+        else tuple(
+            Point(
+                slug=s,
+                input_price_m=1.0 if s == winner else float(i + 2),
+                tps=100.0 if s == winner else 1.0,
+            )
+            for i, s in enumerate(safe_set)
+        ),
         canonical_slug="z-ai/glm-5.2",
         canonical_slug_fetched_at=0.0,
         fetched_at=0.0,
@@ -74,6 +87,7 @@ def _callback(
     wildcard: bool = False,
     cold_start_fallback: tuple[str, ...] | None = None,
     allowed_providers: frozenset[str] | None = None,
+    tolerance: float = 0.0,
 ) -> tuple[OpenRouterParetoCallback, _StubTelemetry]:
     rules = {
         "z-ai/glm-5.2": rule(
@@ -82,6 +96,7 @@ def _callback(
             min_stats_requests=100,
             wildcard=wildcard,
             cold_start_fallback=cold_start_fallback if cold_start_fallback is not None else (),
+            value_regression_tolerance=tolerance,
         )
     }
     stub = _StubTelemetry(entry)
@@ -463,9 +478,7 @@ async def test_post_call_failure_normalizes_prefixed_tagged_model() -> None:
     class _Exc:
         status_code = 429
 
-    request_data = _post_call_request_data(
-        "baseten/fp8", model="openrouter/z-ai/glm-5.2[1m]"
-    )
+    request_data = _post_call_request_data("baseten/fp8", model="openrouter/z-ai/glm-5.2[1m]")
     await cb.async_post_call_failure_hook(request_data, _Exc(), None, None)
     assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is True
 
@@ -675,7 +688,6 @@ async def test_stale_entry_with_winner_returns_unchanged() -> None:
         candidate_winner="baseten",
         candidate_streak=3,
         safe_set=("baseten", "novita", "siliconflow"),
-        frontier=("baseten", "novita", "siliconflow"),
         canonical_slug="z-ai/glm-5.2",
         canonical_slug_fetched_at=0.0,
         fetched_at=0.0,
@@ -1024,7 +1036,6 @@ async def test_explicit_telemetry_not_overwritten_by_yaml_rules() -> None:
     assert stub.calls == ["z-ai/glm-5.2"]
 
 
-
 async def test_failure_event_records_input_cap_on_400_too_large() -> None:
     cd = RateLimitCooldown(threshold=10)
     cb, _ = _callback(_entry("baseten/fp8", ("baseten/fp8",)), cooldown=cd)
@@ -1058,12 +1069,8 @@ async def test_error_log_only_when_rule_log_errors_true(tmp_path, monkeypatch) -
     log_path = tmp_path / "errors.log"
     monkeypatch.setenv("OPENROUTER_PARETO_ERROR_LOG", str(log_path))
 
-    rules_on = {
-        "z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100, log_errors=True)
-    }
-    rules_off = {
-        "z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100, log_errors=False)
-    }
+    rules_on = {"z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100, log_errors=True)}
+    rules_off = {"z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100, log_errors=False)}
 
     class _Exc:
         status_code = 500
@@ -1334,9 +1341,7 @@ async def test_log_decisions_warm_winner_on_cooldown_records_safe_set(tmp_path, 
     log_path = tmp_path / "routing.log"
     monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
     cd = RateLimitCooldown(threshold=1)
-    cb, _ = _decision_callback(
-        _entry("baseten/fp8", ("baseten/fp8", "novita/fp8")), cooldown=cd
-    )
+    cb, _ = _decision_callback(_entry("baseten/fp8", ("baseten/fp8", "novita/fp8")), cooldown=cd)
     cd.record("z-ai/glm-5.2", "baseten/fp8")
     result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
     assert _provider_only(result[0]) == "novita/fp8"
@@ -1349,9 +1354,7 @@ async def test_log_decisions_all_candidates_input_capped_records_input_cap(tmp_p
     log_path = tmp_path / "routing.log"
     monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
     cd = RateLimitCooldown(threshold=10)
-    cb, _ = _decision_callback(
-        _entry("baseten/fp8", ("baseten/fp8", "novita/fp8")), cooldown=cd
-    )
+    cb, _ = _decision_callback(_entry("baseten/fp8", ("baseten/fp8", "novita/fp8")), cooldown=cd)
     cd.record_input_cap("z-ai/glm-5.2", "baseten/fp8")
     cd.record_input_cap("z-ai/glm-5.2", "novita/fp8")
     result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
@@ -1378,9 +1381,7 @@ async def test_log_decisions_all_hot_written_before_the_raise(tmp_path, monkeypa
     log_path = tmp_path / "routing.log"
     monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
     cd = RateLimitCooldown(threshold=1)
-    cb, _ = _decision_callback(
-        _entry("baseten/fp8", ("baseten/fp8",)), cooldown=cd
-    )
+    cb, _ = _decision_callback(_entry("baseten/fp8", ("baseten/fp8",)), cooldown=cd)
     cd.record("z-ai/glm-5.2", "baseten/fp8")
     with pytest.raises(AllProvidersOnCooldown):
         await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
@@ -1423,9 +1424,7 @@ async def test_log_decisions_unknown_region_records_verdict(tmp_path, monkeypatc
     verdict is `unknown` rather than a claim the slug passed the policy."""
     log_path = tmp_path / "routing.log"
     monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
-    cb, _ = _decision_callback(
-        None, cold_start_fallback=("novita/fp8",), exclude_regions=("US",)
-    )
+    cb, _ = _decision_callback(None, cold_start_fallback=("novita/fp8",), exclude_regions=("US",))
     result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
     assert result == []
     (line,) = _decision_lines(log_path)
@@ -1481,9 +1480,7 @@ async def test_log_decisions_unpinned_policy_records_unpinned(tmp_path, monkeypa
 async def test_log_decisions_pinned_warm_winner_records_pinned_mode(tmp_path, monkeypatch) -> None:
     log_path = tmp_path / "routing.log"
     monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
-    cb, _ = _decision_callback(
-        _entry("baseten/fp8", ("baseten/fp8",)), wildcard=False
-    )
+    cb, _ = _decision_callback(_entry("baseten/fp8", ("baseten/fp8",)), wildcard=False)
     deps = [
         {
             "model_name": "m",
@@ -1599,9 +1596,7 @@ async def test_log_decisions_normalizes_model_name_to_rule_key(tmp_path, monkeyp
     log_path = tmp_path / "routing.log"
     monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log_path))
     cb, _ = _decision_callback(_entry("baseten/fp8", ("baseten/fp8",)))
-    await cb.async_filter_deployments(
-        "openrouter/z-ai/glm-5.2[1m]", [_wildcard_dep()], None
-    )
+    await cb.async_filter_deployments("openrouter/z-ai/glm-5.2[1m]", [_wildcard_dep()], None)
     (line,) = _decision_lines(log_path)
     assert "model=z-ai/glm-5.2 " in line
 
@@ -1613,10 +1608,7 @@ def test_format_decision_is_single_line_with_fixed_fields() -> None:
 
     now = datetime(2026, 9, 21, 14, 2, 11, tzinfo=timezone.utc)
     line = format_decision("z-ai/glm-5.2", "wildcard", Decision(None, "declined", None), now=now)
-    assert line == (
-        "2026-09-21T14:02:11+00:00 model=z-ai/glm-5.2 mode=wildcard "
-        "slug=- decision=declined region=-"
-    )
+    assert line == ("2026-09-21T14:02:11+00:00 model=z-ai/glm-5.2 mode=wildcard slug=- decision=declined region=-")
 
 
 async def test_stripped_copy_overrides_unsafe_zdr() -> None:
@@ -1709,7 +1701,6 @@ def _entry_with_excluded(
         candidate_winner="novita/fp8",
         candidate_streak=1,
         safe_set=("novita/fp8",),
-        frontier=("novita/fp8",),
         canonical_slug="z-ai/glm-5.2",
         canonical_slug_fetched_at=0.0,
         fetched_at=0.0,
@@ -1919,7 +1910,6 @@ def _region_entry(
         candidate_winner=winner,
         candidate_streak=1,
         safe_set=(winner,),
-        frontier=(winner,),
         canonical_slug="z-ai/glm-5.2",
         canonical_slug_fetched_at=0.0,
         fetched_at=0.0,
@@ -2030,9 +2020,7 @@ async def test_provider_absent_from_telemetry_is_not_assumed_allowed() -> None:
     """Closed-world: eligibility needs affirmative evidence. A provider that never
     appeared in telemetry has an unknown location, not a safe one."""
     cb = _pinned_region_callback(_region_entry(("sg-provider",), allowed=("allowed",)))
-    result = await cb.async_filter_deployments(
-        "z-ai/glm-5.2", [_pinned_dep("never-seen-in-telemetry/fp8")], None
-    )
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_pinned_dep("never-seen-in-telemetry/fp8")], None)
     assert result == []
 
 
@@ -2058,9 +2046,7 @@ async def test_unidentifiable_deployment_is_not_assumed_allowed() -> None:
 
 async def test_absent_provider_routes_when_allow_unknown_region() -> None:
     cb = _pinned_region_callback_lenient(_region_entry(("sg-provider",), allowed=("allowed",)))
-    result = await cb.async_filter_deployments(
-        "z-ai/glm-5.2", [_pinned_dep("never-seen-in-telemetry/fp8")], None
-    )
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_pinned_dep("never-seen-in-telemetry/fp8")], None)
     assert [_provider_only(d) for d in result] == ["never-seen-in-telemetry/fp8"]
 
 
@@ -2080,9 +2066,7 @@ def _pinned_region_callback_lenient(entry: CacheEntry | None) -> OpenRouterParet
 async def test_trust_fallback_with_empty_list_does_not_degrade_to_unpinned() -> None:
     """trust_fallback means 'only the operator-vetted slugs'. Exhausting them must fail
     closed; silently dropping the pin would be the `unpinned` policy instead."""
-    cb, _ = _wildcard_region_callback(
-        None, cold_start_fallback=(), unverified_region_policy="trust_fallback"
-    )
+    cb, _ = _wildcard_region_callback(None, cold_start_fallback=(), unverified_region_policy="trust_fallback")
     result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
     assert result == []
 
@@ -2166,9 +2150,7 @@ async def test_pinned_multi_slug_rejects_when_any_entry_is_excluded() -> None:
 
 
 async def test_pinned_multi_slug_routes_when_every_entry_is_allowed() -> None:
-    cb = _pinned_region_callback(
-        _region_entry(("blocked",), allowed=("allowed", "second"))
-    )
+    cb = _pinned_region_callback(_region_entry(("blocked",), allowed=("allowed", "second")))
     dep = _multi_pinned_dep(["allowed/fp8", "second/fp8"])
     result = await cb.async_filter_deployments("z-ai/glm-5.2", [dep], None)
     assert len(result) == 1
@@ -2211,17 +2193,11 @@ async def test_multi_slug_deployment_narrows_to_the_winner() -> None:
     matching on the allowlist has to be paired with a rewrite to a singleton pin, or
     OpenRouter can still serve from a sibling that lost the value-walk."""
     entry = _entry("second/fp8", ("second/fp8",))
-    rules = {
-        "z-ai/glm-5.2": rule(
-            precision="fp8", min_context=1_000_000, min_stats_requests=100
-        )
-    }
+    rules = {"z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)}
     cb = OpenRouterParetoCallback(rules=rules, telemetry=_StubTelemetry(entry))
     multi: dict[str, Any] = {
         "model_name": "z-ai/glm-5.2",
-        "litellm_params": {
-            "extra_body": {"provider": {"only": ["first/fp8", "second/fp8"]}}
-        },
+        "litellm_params": {"extra_body": {"provider": {"only": ["first/fp8", "second/fp8"]}}},
         "model_info": {"id": "or-multi"},
     }
     other: dict[str, Any] = {
@@ -2252,9 +2228,7 @@ def _region_cb(
             cold_start_fallback=fallback or [],
         )
     }
-    return OpenRouterParetoCallback(
-        rules=rules, telemetry=_StubTelemetry(entry), cooldown=cooldown
-    )
+    return OpenRouterParetoCallback(rules=rules, telemetry=_StubTelemetry(entry), cooldown=cooldown)
 
 
 def _verified_entry(*, stale: bool = False, winner: str | None = "allowed/fp8") -> CacheEntry:
@@ -2263,7 +2237,6 @@ def _verified_entry(*, stale: bool = False, winner: str | None = "allowed/fp8") 
         candidate_winner=winner,
         candidate_streak=1,
         safe_set=("allowed/fp8",) if winner else (),
-        frontier=("allowed/fp8",) if winner else (),
         canonical_slug="z-ai/glm-5.2",
         canonical_slug_fetched_at=0.0,
         fetched_at=0.0,
@@ -2278,12 +2251,8 @@ async def test_pinned_trust_fallback_skips_a_cooled_down_provider() -> None:
     switching routing modes silently drops the 429 mitigation."""
     cd = RateLimitCooldown(threshold=1)
     cd.record("z-ai/glm-5.2", "allowed/fp8")
-    cb = _region_cb(
-        None, policy="trust_fallback", fallback=["allowed/fp8"], cooldown=cd
-    )
-    result = await cb.async_filter_deployments(
-        "z-ai/glm-5.2", [_pinned_dep("allowed/fp8")], None, {}
-    )
+    cb = _region_cb(None, policy="trust_fallback", fallback=["allowed/fp8"], cooldown=cd)
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_pinned_dep("allowed/fp8")], None, {})
     assert result == []
 
 
@@ -2294,9 +2263,7 @@ async def test_pinned_trust_fallback_routes_when_provider_is_not_cooled() -> Non
         fallback=["allowed/fp8"],
         cooldown=RateLimitCooldown(threshold=1),
     )
-    result = await cb.async_filter_deployments(
-        "z-ai/glm-5.2", [_pinned_dep("allowed/fp8")], None, {}
-    )
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_pinned_dep("allowed/fp8")], None, {})
     assert [_provider_only(d) for d in result] == ["allowed/fp8"]
 
 
@@ -2305,7 +2272,6 @@ async def test_verified_winner_routes_under_region_policy() -> None:
     cb = _region_cb(_verified_entry())
     ok = await cb.async_filter_deployments("z-ai/glm-5.2", [_pinned_dep("allowed/fp8")], None, {})
     assert [_provider_only(d) for d in ok] == ["allowed/fp8"]
-
 
 
 def _strict_callback(entry: CacheEntry | None) -> OpenRouterParetoCallback:
@@ -2335,9 +2301,7 @@ async def test_default_mode_client_pin_reaches_wire_unchanged() -> None:
     """Documented freedom: in default mode a client's extra_body.provider wins litellm's
     merge, so the plugin does not fight it. Here we assert the plugin left it alone."""
     cb, _ = _callback(_entry("baseten", ("baseten",)))
-    request_kwargs: dict[str, Any] = {
-        "extra_body": {"provider": {"only": ["deepinfra"], "zdr": False}}
-    }
+    request_kwargs: dict[str, Any] = {"extra_body": {"provider": {"only": ["deepinfra"], "zdr": False}}}
     await cb.async_filter_deployments("z-ai/glm-5.2", _deployments(), None, request_kwargs)
     provider = request_kwargs["extra_body"]["provider"]
     assert provider == {"only": ["deepinfra"], "zdr": False}
@@ -2376,9 +2340,7 @@ async def test_strict_mode_ignores_provider_without_only() -> None:
     a provider, so strict mode lets it through."""
     cb = _strict_callback(_entry("baseten", ("baseten",)))
     request_kwargs: dict[str, Any] = {"extra_body": {"provider": {"quantizations": ["fp8"]}}}
-    result = await cb.async_filter_deployments(
-        "z-ai/glm-5.2", _deployments(), None, request_kwargs
-    )
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", _deployments(), None, request_kwargs)
     assert [_id_of(d) for d in result] == ["or-baseten"]
 
 
@@ -2488,9 +2450,7 @@ def test_load_telemetry_config_raises_on_non_dict() -> None:
 def test_load_telemetry_config_raises_on_ca_with_verify_false() -> None:
     from litellm_plugin_openrouter_pareto.config import RuleConfigError, load_telemetry_config
 
-    old = _set_litellm_attr(
-        "openrouter_pareto_telemetry", {"ssl_verify": False, "ssl_ca_cert": "/ca.pem"}
-    )
+    old = _set_litellm_attr("openrouter_pareto_telemetry", {"ssl_verify": False, "ssl_ca_cert": "/ca.pem"})
     try:
         with pytest.raises(RuleConfigError):
             load_telemetry_config()
@@ -2645,9 +2605,7 @@ async def test_warm_all_hot_message_names_model_winner_and_safe_set() -> None:
     """The exception carries the plugin's own reason (not litellm's generic
     RouterRateLimitError with an empty cooldown_list)."""
     cd = RateLimitCooldown(threshold=1)
-    cb, _ = _callback(
-        _entry("baseten", ("baseten", "novita", "siliconflow")), cooldown=cd, wildcard=True
-    )
+    cb, _ = _callback(_entry("baseten", ("baseten", "novita", "siliconflow")), cooldown=cd, wildcard=True)
     for slug in ("baseten", "novita", "siliconflow"):
         cd.record("z-ai/glm-5.2", slug)
     with pytest.raises(AllProvidersOnCooldown) as exc_info:
@@ -2661,9 +2619,7 @@ async def test_warm_all_hot_message_names_model_winner_and_safe_set() -> None:
 async def test_warm_single_non_hot_in_safe_set_is_pinned_not_raised() -> None:
     """One non-hot provider in the list is enough: it is pinned instead of raising."""
     cd = RateLimitCooldown(threshold=1)
-    cb, _ = _callback(
-        _entry("baseten", ("baseten", "novita")), cooldown=cd, wildcard=True
-    )
+    cb, _ = _callback(_entry("baseten", ("baseten", "novita")), cooldown=cd, wildcard=True)
     cd.record("z-ai/glm-5.2", "baseten")  # winner hot
     result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
     assert _provider_only(result[0]) == "novita"
@@ -2673,9 +2629,7 @@ async def test_warm_all_input_capped_does_not_raise() -> None:
     """Input cap is a soft preference: all-capped falls back to the winner, not
     the all-429-hot raise."""
     cd = RateLimitCooldown(threshold=10)
-    cb, _ = _callback(
-        _entry("baseten/fp8", ("baseten/fp8", "novita/fp8")), cooldown=cd, wildcard=True
-    )
+    cb, _ = _callback(_entry("baseten/fp8", ("baseten/fp8", "novita/fp8")), cooldown=cd, wildcard=True)
     cd.record_input_cap("z-ai/glm-5.2", "baseten/fp8")
     cd.record_input_cap("z-ai/glm-5.2", "novita/fp8")
     result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
@@ -2684,9 +2638,7 @@ async def test_warm_all_input_capped_does_not_raise() -> None:
 
 async def test_cold_start_all_fallbacks_hot_raises() -> None:
     cd = RateLimitCooldown(threshold=1)
-    cb, _ = _callback(
-        None, wildcard=True, cold_start_fallback=("a/fp8", "b/fp8"), cooldown=cd
-    )
+    cb, _ = _callback(None, wildcard=True, cold_start_fallback=("a/fp8", "b/fp8"), cooldown=cd)
     cd.record("z-ai/glm-5.2", "a/fp8")
     cd.record("z-ai/glm-5.2", "b/fp8")
     with pytest.raises(AllProvidersOnCooldown, match="429 cooldown"):
@@ -2899,9 +2851,7 @@ async def test_explicit_cooldown_survives_cooldown_config() -> None:
     """An explicitly injected cooldown is never replaced by global config
     (lazy resolution preserves injected deps - same contract as telemetry)."""
     injected = RateLimitCooldown(window_s=42.0, threshold=9, input_cap_ttl_s=99.0)
-    old = _set_litellm_attr(
-        "openrouter_pareto_cooldown", {"rate_limit_window_s": 90.0}
-    )
+    old = _set_litellm_attr("openrouter_pareto_cooldown", {"rate_limit_window_s": 90.0})
     try:
         cb = OpenRouterParetoCallback(
             rules={"z-ai/glm-5.2": rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)},
@@ -2963,7 +2913,8 @@ async def test_allowlist_filters_cold_start_fallback() -> None:
     """Cold-start fallbacks whose base is not in the allowlist are skipped."""
     allowed = frozenset({"venice"})
     cb, _ = _callback(
-        None, wildcard=True,
+        None,
+        wildcard=True,
         cold_start_fallback=("novita/fp8", "venice/fp8"),
         allowed_providers=allowed,
     )
@@ -2976,7 +2927,8 @@ async def test_allowlist_all_fallbacks_disallowed_returns_empty() -> None:
     the plugin declines to route (returns [])."""
     allowed = frozenset({"z-ai"})
     cb, _ = _callback(
-        None, wildcard=True,
+        None,
+        wildcard=True,
         cold_start_fallback=("novita/fp8", "baseten/fp8"),
         allowed_providers=allowed,
     )
@@ -3071,14 +3023,20 @@ async def test_allowlist_filters_then_404_re_discovers() -> None:
 
 
 async def test_wildcard_winner_hot_walks_frontier_before_dominated() -> None:
-    """On the winner's 429 the fallback walk continues the pareto walk: remaining
-    frontier points cheapest-first come before dominated safe-set members."""
+    """On the winner's 429 the fallback re-runs the value walk over the remaining
+    points: novita (+79% throughput for +8% price over relace) is picked over the
+    cheaper-but-slower providers, and the dominated cheapest (z-ai) is last."""
     cd = RateLimitCooldown(threshold=1)
     cb, _ = _callback(
         _entry(
             "baseten/fp8",
-            ("baseten/fp8", "novita/fp8", "siliconflow/fp8", "venice/fp8", "z-ai/fp8"),
-            frontier=("baseten/fp8", "novita/fp8", "siliconflow/fp8"),
+            ("baseten/fp8", "morph/fp8", "relace/fp4", "novita/fp8"),
+            points=(
+                Point(slug="morph/fp8", input_price_m=0.12, tps=6.0),
+                Point(slug="relace/fp4", input_price_m=0.13, tps=24.0),
+                Point(slug="novita/fp8", input_price_m=0.14, tps=43.0),
+                Point(slug="baseten/fp8", input_price_m=0.20, tps=193.0),
+            ),
         ),
         cooldown=cd,
         wildcard=True,
@@ -3088,35 +3046,41 @@ async def test_wildcard_winner_hot_walks_frontier_before_dominated() -> None:
     assert _provider_only(result[0]) == "novita/fp8"
 
 
-async def test_wildcard_winner_hot_and_frontier_hot_lands_on_dominated_last() -> None:
-    """Dominated safe-set members are a last resort: reached only after every
-    frontier point is hot."""
+async def test_wildcard_winner_hot_and_next_hot_lands_on_re_walked_second() -> None:
+    """With the winner and the re-walked first both hot, the fallback takes the
+    re-walked second (relace, +79% over morph) - not the cheapest (morph)."""
     cd = RateLimitCooldown(threshold=1)
     cb, _ = _callback(
         _entry(
             "baseten/fp8",
-            ("baseten/fp8", "novita/fp8", "siliconflow/fp8", "venice/fp8", "z-ai/fp8"),
-            frontier=("baseten/fp8", "novita/fp8", "siliconflow/fp8"),
+            ("baseten/fp8", "morph/fp8", "relace/fp4", "novita/fp8"),
+            points=(
+                Point(slug="morph/fp8", input_price_m=0.12, tps=6.0),
+                Point(slug="relace/fp4", input_price_m=0.13, tps=24.0),
+                Point(slug="novita/fp8", input_price_m=0.14, tps=43.0),
+                Point(slug="baseten/fp8", input_price_m=0.20, tps=193.0),
+            ),
         ),
         cooldown=cd,
         wildcard=True,
     )
     cd.record("z-ai/glm-5.2", "baseten/fp8")
     cd.record("z-ai/glm-5.2", "novita/fp8")
-    cd.record("z-ai/glm-5.2", "siliconflow/fp8")
     result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
-    assert _provider_only(result[0]) == "venice/fp8"
+    assert _provider_only(result[0]) == "relace/fp4"
 
 
 async def test_wildcard_frontier_all_hot_with_dominated_absent_raises() -> None:
-    """Frontier-only cache (no dominated members in the safe set): the all-hot raise
-    keys off the frontier-first walk like any other."""
+    """A two-point cache: the all-hot raise keys off the re-run walk like any other."""
     cd = RateLimitCooldown(threshold=1)
     cb, _ = _callback(
         _entry(
             "baseten/fp8",
             ("baseten/fp8", "novita/fp8"),
-            frontier=("baseten/fp8", "novita/fp8"),
+            points=(
+                Point(slug="novita/fp8", input_price_m=0.14, tps=43.0),
+                Point(slug="baseten/fp8", input_price_m=0.20, tps=193.0),
+            ),
         ),
         cooldown=cd,
         wildcard=True,
@@ -3125,3 +3089,159 @@ async def test_wildcard_frontier_all_hot_with_dominated_absent_raises() -> None:
     cd.record("z-ai/glm-5.2", "novita/fp8")
     with pytest.raises(AllProvidersOnCooldown):
         await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+
+
+async def test_pinned_winner_hot_re_walks_over_real_points() -> None:
+    """Pinned mode must reorder under real geometry too, not just wildcard. With the
+    same point set as the wildcard re-walk test, a hot winner must narrow to novita -
+    the re-walked first pick (+79% throughput for +8% price over relace) - and never to
+    morph, which the old cheapest-first ordering would have reached."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        _entry(
+            "baseten",
+            ("baseten", "morph", "relace", "novita"),
+            points=(
+                Point(slug="morph", input_price_m=0.12, tps=6.0),
+                Point(slug="relace", input_price_m=0.13, tps=24.0),
+                Point(slug="novita", input_price_m=0.14, tps=43.0),
+                Point(slug="baseten", input_price_m=0.20, tps=193.0),
+            ),
+        ),
+        cooldown=cd,
+    )
+    cd.record("z-ai/glm-5.2", "baseten")  # winner hot
+    deployments = [_dep("or-baseten"), _dep("or-morph"), _dep("or-relace"), _dep("or-novita")]
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", deployments, None)
+    assert [_id_of(d) for d in result] == ["or-novita"]
+
+
+async def test_pinned_winner_hot_and_first_pick_hot_takes_re_walked_second() -> None:
+    """Pinned counterpart of the sequential-elimination step: with the winner and the
+    re-walked first both hot, pinned mode narrows to the re-walked second (relace)."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        _entry(
+            "baseten",
+            ("baseten", "morph", "relace", "novita"),
+            points=(
+                Point(slug="morph", input_price_m=0.12, tps=6.0),
+                Point(slug="relace", input_price_m=0.13, tps=24.0),
+                Point(slug="novita", input_price_m=0.14, tps=43.0),
+                Point(slug="baseten", input_price_m=0.20, tps=193.0),
+            ),
+        ),
+        cooldown=cd,
+    )
+    cd.record("z-ai/glm-5.2", "baseten")
+    cd.record("z-ai/glm-5.2", "novita")
+    deployments = [_dep("or-baseten"), _dep("or-morph"), _dep("or-relace"), _dep("or-novita")]
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", deployments, None)
+    assert [_id_of(d) for d in result] == ["or-relace"]
+
+
+async def test_wildcard_excludes_hot_before_walking_not_after() -> None:
+    """A provider justified only by a stepping stone must not survive on that stone's
+    order position once the stone is hot. `c` is reachable only via `e`, so with `e`
+    hot the walk over what remains picks `a`; filtering a full-set order would have
+    left `c` first."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        _entry(
+            "c",
+            ("a", "e", "c"),
+            points=(
+                Point(slug="a", input_price_m=1.0, tps=10.0),
+                Point(slug="e", input_price_m=1.4, tps=13.1),
+                Point(slug="c", input_price_m=1.96, tps=17.16),
+            ),
+        ),
+        cooldown=cd,
+        tolerance=0.1,
+        wildcard=True,
+    )
+    cd.record("z-ai/glm-5.2", "e")  # the stepping stone is hot
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "a"
+
+
+async def test_pinned_excludes_hot_before_walking_not_after() -> None:
+    """Pinned counterpart of the stepping-stone exclusion."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        _entry(
+            "c",
+            ("a", "e", "c"),
+            points=(
+                Point(slug="a", input_price_m=1.0, tps=10.0),
+                Point(slug="e", input_price_m=1.4, tps=13.1),
+                Point(slug="c", input_price_m=1.96, tps=17.16),
+            ),
+        ),
+        cooldown=cd,
+        tolerance=0.1,
+    )
+    cd.record("z-ai/glm-5.2", "e")
+    deployments = [_dep("or-a"), _dep("or-e"), _dep("or-c")]
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", deployments, None)
+    assert [_id_of(d) for d in result] == ["or-a"]
+
+
+async def test_no_points_entry_still_honors_exclude_for_all_hot_raise() -> None:
+    """Regression guard: a points-less entry must still honor `exclude`, or the all-hot
+    raise never fires and a hot provider is pinned - worse than the behavior before the
+    exclude fix. The entry here is hand-built (no points), the supported path for
+    entries a caller constructs directly."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        _entry("a", ("a", "e", "c"), points=()),
+        cooldown=cd,
+        wildcard=True,
+    )
+    for slug in ("a", "e", "c"):
+        cd.record("z-ai/glm-5.2", slug)  # every candidate is hot
+    with pytest.raises(AllProvidersOnCooldown):
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+
+
+async def test_no_points_entry_excludes_hot_and_pins_a_cold_one() -> None:
+    """The same branch, non-degenerate case: the hot provider is dropped from the
+    returned list rather than pinned."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(
+        _entry("a", ("a", "e"), points=()),
+        cooldown=cd,
+        wildcard=True,
+    )
+    cd.record("z-ai/glm-5.2", "a")  # winner hot
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "e"
+
+
+async def test_all_disallowed_raise_does_not_blame_rate_limits() -> None:
+    """An all-allowlist-disallowed state raises the same exception, so the message
+    must not report it as a 429: an operator reading "on a 429 cooldown" would chase
+    rate limits that never happened. Verified with zero cooldown hits recorded."""
+    cb, _ = _callback(
+        _entry("baseten", ("baseten", "novita")),
+        wildcard=True,
+        allowed_providers=frozenset({"someoneelse"}),
+    )
+    with pytest.raises(AllProvidersOnCooldown) as exc:
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    message = str(exc.value)
+    assert "allowed-providers" in message
+    assert "no 429 is involved" in message
+    assert "on a 429 cooldown" not in message
+
+
+async def test_all_hot_raise_still_blames_rate_limits() -> None:
+    """The converse: a genuine all-hot state must still say so."""
+    cd = RateLimitCooldown(threshold=1)
+    cb, _ = _callback(_entry("baseten", ("baseten", "novita")), cooldown=cd, wildcard=True)
+    for slug in ("baseten", "novita"):
+        cd.record("z-ai/glm-5.2", slug)
+    with pytest.raises(AllProvidersOnCooldown) as exc:
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert "429 cooldown" in str(exc.value)
+    assert "allowed-providers" not in str(exc.value)

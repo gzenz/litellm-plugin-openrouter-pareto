@@ -25,11 +25,23 @@ class Candidate:
 
 
 @dataclass(frozen=True, slots=True)
+class Point:
+    """A scored candidate reduced to what the price/throughput frontier and walk need.
+    This is what gets cached, so the frontier can be recomputed per request over the
+    points still available rather than frozen at selection time - see `ranked_order`."""
+
+    slug: str
+    input_price_m: float
+    tps: float
+
+
+@dataclass(frozen=True, slots=True)
 class Selection:
     winner: Candidate | None
     safe_set: tuple[str, ...]
     candidates: tuple[Candidate, ...]
     frontier: tuple[str, ...]
+    points: tuple[Point, ...] = ()
     excluded_bases: tuple[str, ...] = ()
     allowed_bases: tuple[str, ...] = ()
 
@@ -243,23 +255,105 @@ def _value_walk(
     return reduce(advance, frontier[1:], frontier[0])
 
 
-def fallback_order(
-    winner: str | None,
-    frontier: tuple[str, ...],
-    safe_set: tuple[str, ...],
+def _frontier_of(points: tuple[Point, ...]) -> tuple[Point, ...]:
+    """The pareto frontier over an arbitrary point set: apply the same tiering and
+    monotonic-throughput reduction used at selection time, so a re-run over a subset
+    yields exactly the frontier that subset would have produced."""
+    if not points:
+        return ()
+    as_candidates = tuple(
+        Candidate(
+            slug=p.slug,
+            tag=p.slug,
+            input_price_m=p.input_price_m,
+            output_price_m=0.0,
+            tps=p.tps,
+            requests=0,
+            context=0,
+            uptime=0.0,
+        )
+        for p in points
+    )
+    frontier, _ = _tier_and_frontier(as_candidates)
+    return tuple(
+        Point(slug=c.slug, input_price_m=c.input_price_m, tps=c.tps) for c in frontier
+    )
+
+
+def _walk_points(frontier: tuple[Point, ...], tolerance: float) -> Point | None:
+    """`_value_walk` over Points. The acceptance rule is identical: move only when the
+    percentage throughput gain plus the operator's tolerance covers the percentage
+    price increase."""
+    if not frontier:
+        return None
+
+    def advance(winner: Point, candidate: Point) -> Point:
+        price_increase = (candidate.input_price_m - winner.input_price_m) / winner.input_price_m
+        speed_gain = (candidate.tps - winner.tps) / winner.tps
+        return candidate if speed_gain + tolerance >= price_increase else winner
+
+    return reduce(advance, frontier[1:], frontier[0])
+
+
+def _sanitized(points: tuple[Point, ...]) -> tuple[Point, ...]:
+    """Drop points the walk cannot order (non-finite or non-positive coordinates) and
+    collapse duplicate slugs to the fastest, tie-breaking on the cheaper price exactly
+    as `_dedupe_by_slug` does. Both non-positive price and non-positive throughput are
+    screened because both are division denominators downstream (`_add_tier`,
+    `_walk_points`); a zero in either raises on the request path."""
+    by_slug: dict[str, Point] = {}
+    for p in points:
+        if not (math.isfinite(p.input_price_m) and math.isfinite(p.tps)):
+            continue
+        if p.input_price_m <= 0 or p.tps <= 0:
+            continue
+        current = by_slug.get(p.slug)
+        if current is None or (p.tps, -p.input_price_m) > (current.tps, -current.input_price_m):
+            by_slug[p.slug] = p
+    return tuple(by_slug.values())
+
+
+def ranked_order(
+    points: tuple[Point, ...],
+    tolerance: float,
+    *,
+    exclude: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
-    """The order a 429 / allowlist walk should try providers in. The value walk
-    judged price-vs-throughput tradeoffs on the frontier, so the remaining frontier
-    points come first (cheapest-first, the frontier's own order); dominated safe-set
-    members are a last resort. A None winner yields just the rest; members of one
-    list that are missing from the other are never dropped."""
-    ordered = (winner,) if winner is not None else ()
-    seen = {slug for slug in ordered if slug is not None}
-    for slug in (*frontier, *safe_set):
-        if slug not in seen:
-            seen.add(slug)
-            ordered = (*ordered, slug)
-    return ordered
+    """The order to try providers in: repeatedly take the value walk's terminal from
+    the points still available, then remove it and re-run. Each entry is what the walk
+    would have chosen had every earlier one been unavailable, which is what makes the
+    operator's `value_regression_tolerance` apply to the fallback too.
+
+    `exclude` drops providers that are already known-unusable (on cooldown, not
+    allowlisted). Recomputing the frontier over the remaining points rather than
+    freezing it at selection time is the point: a provider dominated by the current
+    winner can be the right choice once that winner is gone, and a frontier computed
+    with the winner present would never surface it.
+
+    Ordering by the frontier's own price-ascending order would be wrong instead: the
+    frontier ascends in price, and the cheap end of a pareto frontier is the slow end
+    by construction, so a cheapest-first walk heads for the worst provider rather than
+    the next-best one.
+
+    Inputs are screened here rather than trusted: non-finite or non-positive
+    coordinates are dropped and duplicate slugs collapse to the fastest (cheaper
+    price breaking a tie), because the ordering below cannot order what it cannot
+    compare. A NaN price makes the sort non-transitive and leaves the result
+    implementation-defined; a NaN throughput empties the tier it lands in; a zero in
+    either coordinate is a division denominator in `_add_tier` and `_walk_points`.
+    Selection guarantees all of this upstream, and the cache re-checks finiteness on
+    load, but neither covers a hand-built or hand-edited tuple - a defined answer
+    beats a documented coin flip."""
+    sanitized = _sanitized(points)
+    available = tuple(p for p in sanitized if p.slug not in exclude)
+    order: list[str] = []
+    while available:
+        winner = _walk_points(_frontier_of(available), tolerance)
+        if winner is None:
+            break
+        order.append(winner.slug)
+        available = tuple(p for p in available if p.slug != winner.slug)
+    return tuple(order)
 
 
 def select_candidates(
@@ -279,13 +373,16 @@ def select_candidates(
     deduped = _dedupe_by_slug(stage1)
     frontier_candidates, frontier = _tier_and_frontier(deduped)
     winner = _value_walk(frontier_candidates, rule.value_regression_tolerance)
-    cheapest_first = sorted(deduped, key=lambda c: (c.input_price_m, -c.tps))
-    safe_set = tuple(c.slug for c in cheapest_first)
+    cheap_first = sorted(deduped, key=lambda c: (c.input_price_m, -c.tps))
+    safe_set = tuple(c.slug for c in cheap_first)
     return Selection(
         winner=winner,
         safe_set=safe_set,
         candidates=stage1,
         frontier=frontier,
+        points=tuple(
+            Point(slug=c.slug, input_price_m=c.input_price_m, tps=c.tps) for c in cheap_first
+        ),
         excluded_bases=tuple(sorted(_excluded_bases(stats_endpoints, rule))),
         allowed_bases=tuple(sorted(_allowed_bases(stats_endpoints, rule))),
     )

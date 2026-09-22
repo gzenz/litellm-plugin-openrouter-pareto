@@ -160,12 +160,13 @@ When every provider in the safe set is hot, the plugin raises
 `AllProvidersOnCooldown` (surfaced to the caller as a failed request) rather than
 re-pinning a known-failing provider or ceding to OpenRouter's own selection, which
 would bypass `max_price`, `exclude_regions`, and the precision/context filters. A
-single non-hot provider in the safe set is still pinned; only an all-429-hot list
+single non-hot provider in the safe set is still pinned; only an all-429-hot (or
+all-allowlist-disallowed) list
 stops routing. Input caps never raise this - a capped provider is still tried (a
 small request may succeed under the cap), and only the 429 cooldown is a hard stop.
-The fallback walk continues the pareto walk: after the winner it tries the remaining
-pareto-frontier providers cheapest-first, and only then the dominated (off-frontier)
-safe-set members.
+The fallback continues the pareto walk by re-running it: each unavailable provider is
+removed and the walk re-run over what remains, so the fallback is what the value walk
+would have chosen had the earlier picks been gone.
 
 ### Retry policy for wildcard mode
 
@@ -366,7 +367,7 @@ sends the bare `z-ai/glm-5.2`, without a separate rule entry.
 | `min_context` | `1000000` | Minimum advertised context length. |
 | `min_stats_requests` | `100` | Minimum recent sample size before a provider is scored. |
 | `promotion_polls` | `1` | Consecutive polls a new value-winner must win before it is promoted (flap damping). |
-| `value_regression_tolerance` | `0.0` | Slack that lets a pricier, faster provider win over the cheaper incumbent on the frontier. At `0.0` a move happens only when the percentage throughput gain at least matches the percentage price increase; higher values tolerate paying disproportionately more for speed. |
+| `value_regression_tolerance` | `0.0` | Slack that lets a pricier, faster provider win over the cheaper incumbent on the frontier. At `0.0` a move happens only when the percentage throughput gain at least matches the percentage price increase; higher values tolerate paying disproportionately more for speed. Applies to the winner and to every step of the re-run fallback walk. |
 | `wildcard` | `false` | `true` injects the winner per request on one deployment; `false` narrows among pinned deployments. |
 | `log_errors` | `false` | `true` appends routed `>=400` errors to `OPENROUTER_PARETO_ERROR_LOG`. |
 | `log_decisions` | `false` | `true` appends every routing decision for this model to `OPENROUTER_PARETO_ROUTING_LOG`. |
@@ -410,7 +411,7 @@ The reasons are a closed set, one per terminal exit, so a branch cannot be added
 naming how it chose:
 
 - `winner` - the value-walk winner, off cooldown and input-capped only as a preference.
-- `safe_set` - the winner was unusable (cooldown, allowlist), so the next preferred provider was taken (remaining frontier points first, dominated providers last).
+- `safe_set` - the winner was unusable (cooldown, allowlist), so the walk was re-run and the next preferred provider was taken.
 - `input_cap` - every non-hot candidate had a recorded input cap; the winner among them is still preferred (better to try than to fail).
 - `cold_start` - no usable telemetry entry, so an operator-vetted `cold_start_fallback` provider was pinned.
 - `all_hot` - every eligible provider was 429-hot; logged before `AllProvidersOnCooldown` is raised, since no request ever reaches a success hook on that path.
@@ -504,20 +505,26 @@ within the TTL window reuses the cached list without re-probing.
   passing the hard filters is evicted immediately.
 - On stale or empty telemetry, or no winner, the full healthy deployment set is
   returned unchanged (pinned mode); in wildcard mode the cold-start fallback list is
-  walked instead. Telemetry states never narrow to an empty list on their own. An
+  walked instead. Telemetry states never narrow to an empty list on their own; only
+  `exclude_regions` can, by rejecting every healthy deployment. An
   all-input-capped state falls back to the winner (a preference skip, not a hard
   exclusion, since a small request may still succeed under the cap). In wildcard
-  mode the only hard stop that narrows to nothing is an all-429-hot safe set, which
+  mode the only hard stop that narrows to nothing is an all-429-hot or
+  all-allowlist-disallowed candidate list, which
   raises `AllProvidersOnCooldown` (see the 429 use case) rather than cede to
   OpenRouter. Pinned mode does not raise: each provider is its own litellm
   deployment, so litellm's own per-deployment 429 cooldown already removes a
   rate-limited deployment from the healthy set, and the plugin hands back the
   winner if its slug is still among them.
-- If the winner is in 429 cooldown or not healthy, it falls back to the next
-  non-cooldown provider in the safe set (winner, then the remaining pareto-frontier
-  points cheapest-first, then the dominated off-frontier providers as a last resort),
-  keeping trying the list until one is not on cooldown; in wildcard mode only an
-  all-429-hot list raises.
+- If the winner is in 429 cooldown or not healthy, the value walk is re-run per
+  request over the providers still available, and the winner of that re-run is pinned;
+  unavailable providers are then removed and the walk re-run again, so the list is
+  walked in sequential-elimination order until one is not on cooldown. Re-running
+  rather than following a frontier fixed at selection time matters for two reasons:
+  `value_regression_tolerance` governs the fallback as well as the winner, and a
+  provider that was dominated by the now-unavailable winner can take over (a frontier
+  computed with the winner present would never surface it). In wildcard mode only an
+  all-429-hot or all-allowlist-disallowed list raises.
 - The telemetry cache is stored per `(model, rule)` fingerprint, so a worker configured
   with `exclude_regions` never inherits a winner computed by a worker without it, and
   two workers with different policies for the same model do not evict each other's

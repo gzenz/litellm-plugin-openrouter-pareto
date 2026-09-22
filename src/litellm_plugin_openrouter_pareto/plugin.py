@@ -35,7 +35,7 @@ from .decision_log import (
     format_decision,
 )
 from .error_log import or_decision_log, or_error_log
-from .scorer import fallback_order
+from .scorer import ranked_order
 from .telemetry import DEFAULT_ALLOWLIST_TTL_S, CacheEntry, Telemetry
 
 _OR_PREFIX = "or-"
@@ -87,15 +87,21 @@ class StrictProviderConflict(ValueError):
 
 
 class AllProvidersOnCooldown(ValueError):
-    """Every provider in the safe set (or cold-start fallback list) for a managed
-    model is on a 429 cooldown. Raised from the deployment filter instead of
-    returning []: an empty list makes the router raise a generic
-    RouterRateLimitError whose cooldown_list is read from litellm's own
-    cooldown cache, which is empty here (the plugin's RateLimitCooldown is a
-    separate in-process store), so the surfaced error carries no reason. The
+    """Every candidate for a managed model is on a 429 cooldown. WILDCARD MODE ONLY:
+    pinned mode never raises it, since each provider is its own litellm deployment
+    and litellm's per-deployment cooldown already removes a rate-limited one from the
+    healthy set - pinned mode hands back the winner when its slug is still among them.
+
+    Raised from the deployment filter instead of returning []: an empty list makes the
+    router raise a generic RouterRateLimitError whose cooldown_list is read from
+    litellm's own cooldown cache, which is empty here (the plugin's RateLimitCooldown
+    is a separate in-process store), so the surfaced error carries no reason. The
     router re-raises filter exceptions verbatim (same path as
-    StrictProviderConflict), so this surfaces the plugin's own message. Input
-    caps and region policy never raise this - only an all-429-hot state does."""
+    StrictProviderConflict), so this surfaces the plugin's own message. Input caps and
+    region policy never raise this. The raise fires when the walk finds no usable
+    provider at all, which is an all-429-hot state OR an all-allowlist-disallowed one;
+    the message and the log name which, since reporting the latter as a rate limit
+    sends an operator after 429s that never happened."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,9 +177,7 @@ class OpenRouterParetoCallback(CustomLogger):
                     self._rules,
                     verify=telemetry_verify(tel_config),
                     allowlist_ttl_s=(
-                        allowlist_config.ttl_s
-                        if allowlist_config is not None
-                        else DEFAULT_ALLOWLIST_TTL_S
+                        allowlist_config.ttl_s if allowlist_config is not None else DEFAULT_ALLOWLIST_TTL_S
                     ),
                 )
             self._telemetry_resolved = True
@@ -196,7 +200,7 @@ class OpenRouterParetoCallback(CustomLogger):
 
     def _slug_from_id(self, dep_id: object) -> str | None:
         if isinstance(dep_id, str):
-            slug = dep_id[len(_OR_PREFIX):] if dep_id.startswith(_OR_PREFIX) else dep_id
+            slug = dep_id[len(_OR_PREFIX) :] if dep_id.startswith(_OR_PREFIX) else dep_id
             return slug or None
         return None
 
@@ -204,9 +208,7 @@ class OpenRouterParetoCallback(CustomLogger):
         slugs = self._slugs_from_params(litellm_params, model_info)
         return slugs[0] if len(slugs) == 1 else None
 
-    def _slugs_from_params(
-        self, litellm_params: object, model_info: object
-    ) -> tuple[str, ...]:
+    def _slugs_from_params(self, litellm_params: object, model_info: object) -> tuple[str, ...]:
         """Every provider slug a deployment authorizes. `provider.only` is an allowlist,
         not a scalar pin, so a region check that reads only the first element would
         approve `[allowed, excluded]` and still send both on the wire. An entry that is
@@ -236,14 +238,10 @@ class OpenRouterParetoCallback(CustomLogger):
         return ()
 
     def slugs_of(self, deployment: Mapping[str, object]) -> tuple[str, ...]:
-        return self._slugs_from_params(
-            deployment.get("litellm_params"), deployment.get("model_info")
-        )
+        return self._slugs_from_params(deployment.get("litellm_params"), deployment.get("model_info"))
 
     def slug_of(self, deployment: Mapping[str, object]) -> str | None:
-        return self._slug_from_params(
-            deployment.get("litellm_params"), deployment.get("model_info")
-        )
+        return self._slug_from_params(deployment.get("litellm_params"), deployment.get("model_info"))
 
     def _slug_from_kwargs(self, kwargs: Mapping[str, object]) -> str | None:
         # The async_log_failure_event kwargs is litellm's model_call_details. The
@@ -307,21 +305,52 @@ class OpenRouterParetoCallback(CustomLogger):
             return True
         return slug.split("/", 1)[0] in allowlist
 
-    def _ordered_candidates(self, entry: CacheEntry) -> tuple[str, ...]:
-        """The value walk's order: winner, then the remaining pareto frontier points
-        cheapest-first, then dominated safe-set members as a last resort. This is the
-        ranked list selection walks to find the first provider that is usable right
-        now; an entry without a cached frontier (older cache, failed refresh)
-        degrades to winner + cheapest-first safe set."""
-        return fallback_order(entry.winner, entry.frontier, entry.safe_set)
+    def _entry_slugs(self, entry: CacheEntry) -> tuple[str, ...]:
+        """Every slug an entry can offer, so callers can precompute what to exclude."""
+        if entry.points:
+            return tuple(dict.fromkeys(p.slug for p in entry.points))
+        return tuple(dict.fromkeys((entry.winner, *entry.safe_set) if entry.winner is not None else entry.safe_set))
 
-    def _preferred_slugs(self, model: str, entry: CacheEntry) -> tuple[str, ...]:
+    def _ordered_candidates(
+        self,
+        rule: Rule,
+        entry: CacheEntry,
+        exclude: frozenset[str] = frozenset(),
+    ) -> tuple[str, ...]:
+        """The ranked list selection walks to find the first provider usable right now:
+        the cached value-walk winner first, then the value walk re-run over the points
+        that are still available, so `value_regression_tolerance` governs the fallback
+        too and a provider dominated by an unavailable winner can take over.
+
+        `exclude` must be passed the slugs the caller already knows are unusable. The
+        walk has to re-run WITHOUT them, not filter a full-set order afterwards: a
+        provider can be justified only by a cheaper stepping stone, so dropping that
+        stone from the order without re-walking leaves a provider the walk over the
+        available set would have rejected.
+
+        The no-points branch is defensive, not a state current writers produce: an
+        entry for a different cache version is discarded whole (so the caller sees
+        None, not a points-less entry), and a failed refresh marks the entry stale,
+        which both callers gate on before reaching here. It degrades to
+        winner + cheapest-first safe set for callers that build an entry by hand, and
+        still honors `exclude` - the caller relies on the returned list naming only
+        usable providers, so dropping the exclusion here would pin a hot provider
+        instead of letting the all-hot raise fire."""
+        if not entry.points:
+            return tuple(s for s in self._entry_slugs(entry) if s not in exclude)
+        return ranked_order(entry.points, rule.value_regression_tolerance, exclude=exclude)
+
+    def _preferred_slugs(self, model: str, rule: Rule, entry: CacheEntry) -> tuple[str, ...]:
         allowlist = self._allowlist()
+        exclude = frozenset(
+            slug
+            for slug in self._entry_slugs(entry)
+            if self._cooldown.is_skipped(model, slug) or not self._allowlist_allows(slug, allowlist)
+        )
         return tuple(
             slug
-            for slug in self._ordered_candidates(entry)
-            if not self._cooldown.is_skipped(model, slug)
-            and self._allowlist_allows(slug, allowlist)
+            for slug in self._ordered_candidates(rule, entry, exclude)
+            if not self._cooldown.is_skipped(model, slug) and self._allowlist_allows(slug, allowlist)
         )
 
     def _client_provider_only(self, request_kwargs: dict[str, object] | None) -> bool:
@@ -406,21 +435,24 @@ class OpenRouterParetoCallback(CustomLogger):
     ) -> tuple[list[dict[str, object]], Decision]:
         if entry is None or entry.stale or entry.winner is None:
             return self._wildcard_fallback(model, rule, deployments, entry)
-        # On 429: keep trying our own list (winner then safe set) until a
-        # provider is not on cooldown. Input cap is a soft preference, not a
-        # skip: prefer a non-capped provider, but if every non-hot provider is
-        # capped fall back to the first non-hot (the winner if it is not hot)
-        # - a small request may still succeed under the cap, better to try than
-        # to fail. Only an all-429-hot list is a hard stop.
-        # The reason records which of those two rules actually chose: a warm
-        # winner on cooldown means the safe set was walked into.
+        # On 429: keep trying our own list until a provider is not on cooldown. The
+        # unusable slugs are excluded BEFORE the walk, not filtered out of its result:
+        # re-walking over what remains is the whole point, since a provider may be
+        # justified only by a stepping stone that is itself unavailable. Input cap is
+        # a soft preference, not a skip: prefer a non-capped provider, but if every
+        # non-hot provider is capped fall back to the first non-hot (the winner if it
+        # is not hot) - a small request may still succeed under the cap, better to try
+        # than to fail. Only an all-429-hot list is a hard stop.
+        # The reason records which of those two rules actually chose: a warm winner on
+        # cooldown means the walk was re-run past it.
         allowlist = self._allowlist()
-        not_hot = tuple(
-            slug
-            for slug in self._ordered_candidates(entry)
-            if not self._cooldown.is_hot(model, slug)
-            and self._allowlist_allows(slug, allowlist)
-        )
+        # Track the two reasons separately: they are excluded by the same set but are
+        # not the same problem, and an all-allowlist-disallowed state must not be
+        # reported as a rate limit - an operator would chase 429s that never happened.
+        slugs = self._entry_slugs(entry)
+        hot = frozenset(s for s in slugs if self._cooldown.is_hot(model, s))
+        disallowed = frozenset(s for s in slugs if not self._allowlist_allows(s, allowlist))
+        not_hot = self._ordered_candidates(rule, entry, hot | disallowed)
         if not not_hot:
             # Logged before the raise: the exception leaves async_filter_deployments
             # without ever reaching the line after the dispatch, and the router
@@ -431,14 +463,18 @@ class OpenRouterParetoCallback(CustomLogger):
                 "wildcard",
                 Decision(None, ALL_HOT, self._decline_region(model, rule, entry)),
             )
+            if hot and not disallowed:
+                detail = "every provider is on a 429 cooldown; declining to route until one clears"
+            elif disallowed and not hot:
+                detail = "every provider is disallowed by the account's allowed-providers setting; no 429 is involved"
+            else:
+                detail = "every provider is on a 429 cooldown or disallowed by the account's allowed-providers setting"
             raise AllProvidersOnCooldown(
-                f"openrouter-pareto: every provider for {model} is on a 429 "
-                f"cooldown; declining to route until one clears. "
-                f"winner={entry.winner} safe_set={entry.safe_set}"
+                f"openrouter-pareto: {detail} for {model}. "
+                f"winner={entry.winner} safe_set={entry.safe_set} "
+                f"hot={sorted(hot)} disallowed={sorted(disallowed)}"
             )
-        not_capped = tuple(
-            slug for slug in not_hot if not self._cooldown.is_input_capped(model, slug)
-        )
+        not_capped = tuple(slug for slug in not_hot if not self._cooldown.is_input_capped(model, slug))
         if not_capped:
             chosen = not_capped[0]
             reason = WINNER if chosen == entry.winner else SAFE_SET
@@ -458,9 +494,7 @@ class OpenRouterParetoCallback(CustomLogger):
         for configured fallbacks, anything else declines to pin it."""
         return self._region_verdict(model, rule, slug, entry) == REGION_ALLOWED
 
-    def _region_verdict(
-        self, model: str, rule: Rule, slug: str, entry: CacheEntry | None
-    ) -> str:
+    def _region_verdict(self, model: str, rule: Rule, slug: str, entry: CacheEntry | None) -> str:
         """The region policy's verdict on one slug, for `_region_allows` and for the
         decision log. A slug can be allowed because the rule has no region policy, or
         because it has one and the slug passed it; only the latter is a statement about
@@ -492,9 +526,7 @@ class OpenRouterParetoCallback(CustomLogger):
         )
         return REGION_UNKNOWN
 
-    def _decision_region(
-        self, model: str, rule: Rule, slug: str | None, entry: CacheEntry | None
-    ) -> str | None:
+    def _decision_region(self, model: str, rule: Rule, slug: str | None, entry: CacheEntry | None) -> str | None:
         """The region verdict to record for a decision, or None when the rule has no
         region policy at all - a verdict is only meaningful where the policy applied.
         When it did apply, this must not re-emit the warn-once lines `_region_allows`
@@ -546,21 +578,15 @@ class OpenRouterParetoCallback(CustomLogger):
                 continue
             eligible.append(slug)
         if eligible:
-            not_capped = [
-                s for s in eligible if not self._cooldown.is_input_capped(model, s)
-            ]
+            not_capped = [s for s in eligible if not self._cooldown.is_input_capped(model, s)]
             chosen = not_capped[0] if not_capped else eligible[0]
             reason = COLD_START if not_capped else INPUT_CAP
-            decision = Decision(
-                chosen, reason, self._decision_region(model, rule, chosen, entry)
-            )
+            decision = Decision(chosen, reason, self._decision_region(model, rule, chosen, entry))
             return self._with_provider_only(deployments, chosen), decision
         if any_eligible:
             # At least one fallback was region-eligible and every one of them was
             # 429-hot (none made it into `eligible`).
-            self._log_decision(
-                model, rule, "wildcard", Decision(None, ALL_HOT, None)
-            )
+            self._log_decision(model, rule, "wildcard", Decision(None, ALL_HOT, None))
             raise AllProvidersOnCooldown(
                 f"openrouter-pareto: every region-eligible cold-start fallback for "
                 f"{model} is on a 429 cooldown; declining to route until one "
@@ -594,10 +620,7 @@ class OpenRouterParetoCallback(CustomLogger):
             return None
         remembered = frozenset(self._warned)
         try:
-            verdicts = {
-                self._region_verdict(model, rule, slug, entry)
-                for slug in rule.cold_start_fallback
-            }
+            verdicts = {self._region_verdict(model, rule, slug, entry) for slug in rule.cold_start_fallback}
         finally:
             self._warned = set(remembered)
         if verdicts == {REGION_EXCLUDED}:
@@ -778,7 +801,7 @@ class OpenRouterParetoCallback(CustomLogger):
             # gate (strict mode) governs the provider, not this plugin. That is the
             # honest reading of this path, and the log says so: `pass_through`.
             return allowed, Decision(None, PASS_THROUGH, None)
-        for slug in self._preferred_slugs(model, entry):
+        for slug in self._preferred_slugs(model, rule, entry):
             match = [d for d in allowed if slug in self.slugs_of(d)]
             if match:
                 reason = WINNER if slug == entry.winner else SAFE_SET
@@ -789,9 +812,9 @@ class OpenRouterParetoCallback(CustomLogger):
             winner_match = [d for d in allowed if entry.winner in self.slugs_of(d)]
             if winner_match:
                 # The preferred walk found no deployment for any preferred slug, yet the
-                # winner has one. `_preferred_slugs` already excludes the winner unless
-                # it is a hot slug the region policy admits, so say so rather than
-                # claim `winner`.
+                # winner has one. `_preferred_slugs` drops the winner when it is on
+                # cooldown (hot or input-capped) or allowlist-disallowed, so record the
+                # reach-in as `safe_set` rather than claim `winner`.
                 decision = Decision(
                     entry.winner,
                     SAFE_SET,
@@ -863,9 +886,7 @@ class OpenRouterParetoCallback(CustomLogger):
         rule = self._resolve_rules().get(model)
         self._apply_rate_limit_signal(model, status, message, slug, rule)
 
-    def _upstream_message(
-        self, request_data: Mapping[str, object], original_exception: object
-    ) -> str:
+    def _upstream_message(self, request_data: Mapping[str, object], original_exception: object) -> str:
         """The error text used for input-cap detection and the error log.
 
         The passthrough upstream-failure path supplies a synthetic HTTPException

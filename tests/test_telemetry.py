@@ -17,7 +17,7 @@ from litellm_plugin_openrouter_pareto.models import (
     StatsPricing,
     StatsSample,
 )
-from litellm_plugin_openrouter_pareto.scorer import Candidate, Selection
+from litellm_plugin_openrouter_pareto.scorer import Candidate, Point, Selection
 from litellm_plugin_openrouter_pareto.telemetry import (
     OR_CACHE_VERSION,
     Telemetry,
@@ -58,6 +58,7 @@ def _selection(winner_slug: str, safe: tuple[str, ...]) -> Selection:
         safe_set=safe,
         candidates=tuple(_candidate(s) for s in safe),
         frontier=safe,
+        points=tuple(Point(slug=s, input_price_m=1.0, tps=50.0) for s in safe),
     )
 
 
@@ -280,7 +281,10 @@ def test_persist_then_reload_round_trip(tmp_path: Path) -> None:
     entry = reloaded._memory["z-ai/glm-5.2"]
     assert entry.winner == "baseten/fp8"
     assert entry.safe_set == ("baseten/fp8", "novita/fp8")
-    assert entry.frontier == ("baseten/fp8", "novita/fp8")
+    assert entry.points == (
+        Point(slug="baseten/fp8", input_price_m=1.0, tps=50.0),
+        Point(slug="novita/fp8", input_price_m=1.0, tps=50.0),
+    )
     assert entry.stale is False
 
 
@@ -294,7 +298,6 @@ async def test_canonical_slug_reused_within_ttl_without_fetch(tmp_path: Path) ->
         candidate_winner="novita",
         candidate_streak=1,
         safe_set=("novita",),
-        frontier=("novita",),
         canonical_slug="cached-slug",
         canonical_slug_fetched_at=now,
         fetched_at=now,
@@ -394,17 +397,13 @@ def test_persist_survives_lock_held_by_another_process(tmp_path: Path) -> None:
 
     shared = {"model-seed": _glm_rule(), "model-blocked": _glm_rule()}
     seed = _telemetry(tmp_path, shared)
-    entry = seed._apply_promotion(
-        None, _selection("baseten/fp8", ("baseten/fp8",)), _glm_rule(), "slug", 1.0, 1.0
-    )
+    entry = seed._apply_promotion(None, _selection("baseten/fp8", ("baseten/fp8",)), _glm_rule(), "slug", 1.0, 1.0)
     assert entry is not None
     seed._memory["model-seed"] = entry
     seed._persist(tuple(seed._memory.items()), now=0.0)
 
     blocked = _telemetry(tmp_path, shared)
-    other = blocked._apply_promotion(
-        None, _selection("novita/fp8", ("novita/fp8",)), _glm_rule(), "slug", 1.0, 9.0
-    )
+    other = blocked._apply_promotion(None, _selection("novita/fp8", ("novita/fp8",)), _glm_rule(), "slug", 1.0, 9.0)
     assert other is not None
     blocked._memory["model-blocked"] = other
     held = FileLock(str(tmp_path / "cache.lock"), timeout=1)
@@ -436,9 +435,7 @@ def test_stricter_rule_rejects_cached_winner_from_permissive_process(tmp_path: P
     strict = _rule_excluding(["US"])
 
     writer = Telemetry({"z-ai/glm-5.2": permissive}, cache_dir=tmp_path)
-    entry = writer._apply_promotion(
-        None, _selection("baseten/fp8", ("baseten/fp8",)), permissive, "slug", 1.0, 1.0
-    )
+    entry = writer._apply_promotion(None, _selection("baseten/fp8", ("baseten/fp8",)), permissive, "slug", 1.0, 1.0)
     assert entry is not None
     writer._memory["z-ai/glm-5.2"] = entry
     writer._persist(tuple(writer._memory.items()), now=0.0)
@@ -461,9 +458,7 @@ def test_persist_preserves_same_model_entry_written_under_a_different_rule(tmp_p
     model = "z-ai/glm-5.2"
 
     writer = Telemetry({model: permissive}, cache_dir=tmp_path)
-    e1 = writer._apply_promotion(
-        None, _selection("baseten/fp8", ("baseten/fp8",)), permissive, "slug", 1.0, 1.0
-    )
+    e1 = writer._apply_promotion(None, _selection("baseten/fp8", ("baseten/fp8",)), permissive, "slug", 1.0, 1.0)
     assert e1 is not None
     writer._memory[model] = e1
     writer._persist(tuple(writer._memory.items()), now=0.0)
@@ -472,9 +467,7 @@ def test_persist_preserves_same_model_entry_written_under_a_different_rule(tmp_p
     strict_worker = Telemetry({model: strict, "other/model": strict}, cache_dir=tmp_path)
     strict_worker._ensure_disk()
     assert model not in strict_worker._memory, "strict worker reused a permissive winner"
-    e2 = strict_worker._apply_promotion(
-        None, _selection("novita/fp8", ("novita/fp8",)), strict, "slug", 1.0, 2.0
-    )
+    e2 = strict_worker._apply_promotion(None, _selection("novita/fp8", ("novita/fp8",)), strict, "slug", 1.0, 2.0)
     assert e2 is not None
     strict_worker._memory["other/model"] = e2
     strict_worker._persist(tuple(strict_worker._memory.items()), now=0.0)
@@ -499,9 +492,7 @@ def test_rule_fingerprint_ignores_non_scoring_fields() -> None:
         wildcard=True,
         log_errors=True,
     )
-    differs = rule(
-        precision="fp8", min_context=1_000_000, min_stats_requests=100, exclude_regions=["US"]
-    )
+    differs = rule(precision="fp8", min_context=1_000_000, min_stats_requests=100, exclude_regions=["US"])
     assert rule_fingerprint(base) == rule_fingerprint(same)
     assert rule_fingerprint(base) != rule_fingerprint(differs)
 
@@ -515,17 +506,13 @@ def test_same_model_under_two_rules_keeps_both_cache_entries(tmp_path: Path) -> 
     model = "z-ai/glm-5.2"
 
     worker_a = Telemetry({model: permissive}, cache_dir=tmp_path)
-    ea = worker_a._apply_promotion(
-        None, _selection("baseten/fp8", ("baseten/fp8",)), permissive, "slug", 1.0, 1.0
-    )
+    ea = worker_a._apply_promotion(None, _selection("baseten/fp8", ("baseten/fp8",)), permissive, "slug", 1.0, 1.0)
     assert ea is not None
     worker_a._memory[model] = ea
     worker_a._persist(tuple(worker_a._memory.items()), now=0.0)
 
     worker_b = Telemetry({model: strict}, cache_dir=tmp_path)
-    eb = worker_b._apply_promotion(
-        None, _selection("novita/fp8", ("novita/fp8",)), strict, "slug", 1.0, 2.0
-    )
+    eb = worker_b._apply_promotion(None, _selection("novita/fp8", ("novita/fp8",)), strict, "slug", 1.0, 2.0)
     assert eb is not None
     worker_b._memory[model] = eb
     worker_b._persist(tuple(worker_b._memory.items()), now=0.0)
@@ -581,9 +568,7 @@ async def test_stale_fallback_returns_without_waiting_for_the_cache_lock(tmp_pat
 
     rules = {"model-a": _glm_rule()}
     telemetry = _telemetry(tmp_path, rules)
-    entry = telemetry._apply_promotion(
-        None, _selection("baseten/fp8", ("baseten/fp8",)), _glm_rule(), "slug", 1.0, 1.0
-    )
+    entry = telemetry._apply_promotion(None, _selection("baseten/fp8", ("baseten/fp8",)), _glm_rule(), "slug", 1.0, 1.0)
     assert entry is not None
     telemetry._memory["model-a"] = entry
 
@@ -646,9 +631,7 @@ def test_a_failing_worker_cannot_outrank_another_workers_newer_fetch(tmp_path: P
     genuinely newer telemetry, so the pool would keep serving the older winner."""
     rules = {"model-a": _glm_rule()}
     baseline = _telemetry(tmp_path, rules)
-    original = baseline._apply_promotion(
-        None, _selection("a/fp8", ("a/fp8",)), _glm_rule(), "slug", 1.0, 100.0
-    )
+    original = baseline._apply_promotion(None, _selection("a/fp8", ("a/fp8",)), _glm_rule(), "slug", 1.0, 100.0)
     assert original is not None
 
     failing = _telemetry(tmp_path, rules)
@@ -658,9 +641,7 @@ def test_a_failing_worker_cannot_outrank_another_workers_newer_fetch(tmp_path: P
         failing._persist((("model-a", state),), now=0.0)
 
     succeeding = _telemetry(tmp_path, rules)
-    fresher = succeeding._apply_promotion(
-        original, _selection("b/fp8", ("b/fp8",)), _glm_rule(), "slug", 1.0, 200.0
-    )
+    fresher = succeeding._apply_promotion(original, _selection("b/fp8", ("b/fp8",)), _glm_rule(), "slug", 1.0, 200.0)
     assert fresher is not None
     succeeding._persist((("model-a", fresher),), now=0.0)
 
@@ -806,17 +787,13 @@ def test_persist_keeps_a_live_entry_from_another_worker(tmp_path: Path) -> None:
     stamp = time.time()
 
     worker_a = Telemetry({model: permissive}, cache_dir=tmp_path)
-    ea = worker_a._apply_promotion(
-        None, _selection("baseten/fp8", ("baseten/fp8",)), permissive, "slug", stamp, stamp
-    )
+    ea = worker_a._apply_promotion(None, _selection("baseten/fp8", ("baseten/fp8",)), permissive, "slug", stamp, stamp)
     assert ea is not None
     worker_a._memory[model] = ea
     worker_a._persist(tuple(worker_a._memory.items()), now=stamp)
 
     worker_b = Telemetry({model: strict}, cache_dir=tmp_path)
-    eb = worker_b._apply_promotion(
-        None, _selection("novita/fp8", ("novita/fp8",)), strict, "slug", stamp, stamp
-    )
+    eb = worker_b._apply_promotion(None, _selection("novita/fp8", ("novita/fp8",)), strict, "slug", stamp, stamp)
     assert eb is not None
     worker_b._memory[model] = eb
     worker_b._persist(tuple(worker_b._memory.items()), now=stamp + 60.0)
@@ -1029,3 +1006,49 @@ def test_allowlist_version_mismatch_discards_old_allowlist(tmp_path: Path) -> No
     reloaded = _telemetry(tmp_path)
     reloaded._ensure_disk()
     assert reloaded.get_allowed_providers() is None
+
+
+def test_corrupt_point_drops_itself_not_the_whole_cache(tmp_path: Path) -> None:
+    """A single unorderable coordinate must cost one point, not the file. Validating
+    on `_StoredPoint` rejected the entire `_StoredCache`, discarding every healthy
+    entry and the persisted allowlist with them - while
+    `_load_allowed_providers_from_disk` claims the allowlist survives restarts."""
+    from litellm_plugin_openrouter_pareto.telemetry import _StoredCache
+
+    parsed = _StoredCache.model_validate(
+        {
+            "version": OR_CACHE_VERSION,
+            "allowed_providers": ["good"],
+            "allowed_providers_fetched_at": 1.0,
+            "entries": {
+                "model/good": {
+                    "winner": "a",
+                    "points": [{"slug": "a", "input_price_m": 0.1, "tps": 5.0}],
+                },
+                "model/bad": {
+                    "winner": "b",
+                    "points": [
+                        {"slug": "bad", "input_price_m": 0.1, "tps": 0.0},
+                        {"slug": "ok", "input_price_m": 0.2, "tps": 9.0},
+                    ],
+                },
+            },
+        }
+    )
+    assert sorted(parsed.entries) == ["model/bad", "model/good"]
+    assert parsed.allowed_providers == ["good"]
+    assert [p.slug for p in parsed.entries["model/bad"].points] == ["ok"]
+    assert [p.slug for p in parsed.entries["model/good"].points] == ["a"]
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("nan"), float("inf")])
+@pytest.mark.parametrize("field", ["input_price_m", "tps"])
+def test_corrupt_point_is_dropped_for_every_bad_coordinate(tmp_path: Path, bad: float, field: str) -> None:
+    """Every non-finite and non-positive coordinate is dropped: both are division
+    denominators downstream, and a non-finite one leaves the tier sort non-transitive."""
+    from litellm_plugin_openrouter_pareto.telemetry import _StoredEntry
+
+    point: dict[str, float | str] = {"slug": "x", "input_price_m": 0.1, "tps": 5.0}
+    point[field] = bad
+    entry = _StoredEntry.model_validate({"winner": "x", "points": [point]})
+    assert entry.points == []
