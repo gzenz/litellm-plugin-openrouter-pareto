@@ -79,11 +79,12 @@ def test_record_input_cap_makes_skipped() -> None:
 
 
 def test_input_cap_is_one_shot_not_windowed() -> None:
-    cd = RateLimitCooldown(threshold=3, window_s=1.0)
+    """The 429 window does not govern the input-cap skip: it outlives the window it was
+    recorded in. Driven by the injected clock, so the test costs no wall time."""
+    clock = {"t": 0.0}
+    cd = RateLimitCooldown(threshold=3, window_s=1.0, clock=lambda: clock["t"])
     cd.record_input_cap("z-ai/glm-5.2", "baseten/fp8")
-    import time
-
-    time.sleep(1.1)
+    clock["t"] = 1.1
     assert cd.is_skipped("z-ai/glm-5.2", "baseten/fp8") is True
 
 
