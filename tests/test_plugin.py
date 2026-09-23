@@ -88,17 +88,25 @@ def _callback(
     cold_start_fallback: tuple[str, ...] | None = None,
     allowed_providers: frozenset[str] | None = None,
     tolerance: float = 0.0,
+    exclude_providers: tuple[str, ...] = (),
+    input_cap_patterns: tuple[str, ...] | None = None,
+    broken_provider_patterns: tuple[str, ...] = (),
+    broken_provider_ttl_s: float | None = None,
 ) -> tuple[OpenRouterParetoCallback, _StubTelemetry]:
-    rules = {
-        "z-ai/glm-5.2": rule(
-            precision="fp8",
-            min_context=1_000_000,
-            min_stats_requests=100,
-            wildcard=wildcard,
-            cold_start_fallback=cold_start_fallback if cold_start_fallback is not None else (),
-            value_regression_tolerance=tolerance,
-        )
+    rule_kwargs: dict[str, Any] = {
+        "precision": "fp8",
+        "min_context": 1_000_000,
+        "min_stats_requests": 100,
+        "wildcard": wildcard,
+        "cold_start_fallback": cold_start_fallback if cold_start_fallback is not None else (),
+        "value_regression_tolerance": tolerance,
+        "exclude_providers": exclude_providers,
+        "input_cap_patterns": input_cap_patterns,
+        "broken_provider_patterns": broken_provider_patterns,
     }
+    if broken_provider_ttl_s is not None:
+        rule_kwargs["broken_provider_ttl_s"] = broken_provider_ttl_s
+    rules = {"z-ai/glm-5.2": rule(**rule_kwargs)}
     stub = _StubTelemetry(entry)
     if allowed_providers is not None:
         stub._allowed_providers = allowed_providers
@@ -644,7 +652,7 @@ async def test_upstream_message_extracts_input_cap_across_shapes(
     response_body: dict[str, Any] | str,
 ) -> None:
     # _upstream_message must surface the provider error text from each shape
-    # OpenRouter/litellm might produce, so is_input_cap_error can match it.
+    # OpenRouter/litellm might produce, so the built-in input-cap patterns match it.
     cd = RateLimitCooldown(threshold=10)
     cb, _ = _callback(_entry("baseten/fp8", ("baseten/fp8",)), cooldown=cd)
 
@@ -3245,3 +3253,320 @@ async def test_all_hot_raise_still_blames_rate_limits() -> None:
         await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
     assert "429 cooldown" in str(exc.value)
     assert "allowed-providers" not in str(exc.value)
+
+
+# --- exclude_providers: the static blocklist ---
+
+
+async def test_exclude_providers_skips_winner_wildcard() -> None:
+    """A blocklisted winner is dropped from the walk and the next usable provider is
+    pinned, without the blocklist ever having to be re-discovered from an error."""
+    entry = _entry("baseten/fp8", ("baseten/fp8", "novita/fp8"))
+    cb, _ = _callback(entry, wildcard=True, exclude_providers=("baseten",))
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "novita/fp8"
+
+
+async def test_exclude_providers_org_base_skips_every_endpoint_wildcard() -> None:
+    """An org-level entry removes every endpoint of that org, not just the winner's."""
+    entry = _entry("novita/fp8", ("novita/fp8", "novita/fp16", "baseten/fp8"))
+    cb, _ = _callback(entry, wildcard=True, exclude_providers=("novita",))
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "baseten/fp8"
+
+
+async def test_exclude_providers_full_slug_leaves_siblings_eligible() -> None:
+    """A full-slug entry is endpoint-precise: the same org's other variant still routes."""
+    entry = _entry("novita/fp8", ("novita/fp8", "novita/fp16"))
+    cb, _ = _callback(entry, wildcard=True, exclude_providers=("novita/fp8",))
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "novita/fp16"
+
+
+async def test_exclude_providers_filters_narrow_mode() -> None:
+    """Pinned mode narrows to an allowed deployment rather than the excluded winner's."""
+    entry = _entry("baseten", ("baseten", "venice", "novita"))
+    cb, _ = _callback(entry, wildcard=False, exclude_providers=("baseten",))
+    deps = [_dep("or-baseten"), _dep("or-venice"), _dep("or-novita")]
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", deps, None)
+    assert _id_of(result[0]) == "or-venice"
+
+
+async def test_exclude_providers_filters_cold_start_fallback() -> None:
+    """The operator's own fallback list is subject to the operator's own blocklist."""
+    cb, _ = _callback(
+        None,
+        wildcard=True,
+        cold_start_fallback=("novita/fp8", "venice/fp8"),
+        exclude_providers=("novita",),
+    )
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "venice/fp8"
+
+
+async def test_exclude_providers_all_excluded_raise_does_not_blame_rate_limits() -> None:
+    """A blocklist that empties the candidate set raises the same exception as an
+    all-hot state, so the message must name the blocklist: an operator reading
+    "on a 429 cooldown" would chase rate limits that never happened."""
+    cb, _ = _callback(
+        _entry("baseten", ("baseten", "novita")),
+        wildcard=True,
+        exclude_providers=("baseten", "novita"),
+    )
+    with pytest.raises(AllProvidersOnCooldown) as exc:
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    message = str(exc.value)
+    assert "exclude_providers" in message
+    assert "on a 429 cooldown" not in message
+
+
+async def test_exclude_providers_vets_trust_fallback_slugs() -> None:
+    """`trust_fallback` trusts the configured slugs' geography, not their usability: a
+    blocklisted vetted slug is still unusable, and the policy fails closed rather than
+    degrading to the `unpinned` cede."""
+    rules = {
+        "z-ai/glm-5.2": rule(
+            precision="fp8",
+            min_context=1_000_000,
+            min_stats_requests=100,
+            wildcard=True,
+            cold_start_fallback=["novita/fp8"],
+            exclude_regions=["SG"],
+            unverified_region_policy="trust_fallback",
+            exclude_providers=["novita"],
+        )
+    }
+    cb = OpenRouterParetoCallback(rules=rules, telemetry=_StubTelemetry(None))
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert result == []
+
+
+async def test_exclude_providers_default_is_no_filtering() -> None:
+    """Every pre-existing rule has an empty blocklist, so the winner still routes."""
+    cb, _ = _callback(_entry("baseten/fp8", ("baseten/fp8", "novita/fp8")), wildcard=True)
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "baseten/fp8"
+
+
+# --- broken_provider_patterns / input_cap_patterns: the 400 body checks ---
+
+
+async def test_broken_provider_recorded_from_configured_pattern() -> None:
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(
+        _entry("baseten/fp8", ("baseten/fp8",)),
+        cooldown=cd,
+        broken_provider_patterns=("provider returned error",),
+    )
+
+    class _Exc:
+        status_code = 400
+
+        def __str__(self) -> str:
+            return "Provider returned error"
+
+    kwargs = _failure_kwargs("baseten/fp8", _Exc())
+    await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
+    assert cd.is_broken("z-ai/glm-5.2", "baseten/fp8") is True
+    assert cd.is_hot("z-ai/glm-5.2", "baseten/fp8") is False
+    assert cd.is_input_capped("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+async def test_broken_provider_detection_is_off_by_default() -> None:
+    """The one behaviour change that would be unsafe to ship on by default: an
+    unconfigured rule must not blacklist a provider from a 400 it never claimed to
+    understand. Most 400s are the caller's bad request, and the plugin pins one
+    provider, so a retry loop would blacklist a healthy one."""
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(_entry("baseten/fp8", ("baseten/fp8",)), cooldown=cd)
+
+    class _Exc:
+        status_code = 400
+
+        def __str__(self) -> str:
+            return "Provider returned error"
+
+    kwargs = _failure_kwargs("baseten/fp8", _Exc())
+    await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
+    assert cd.is_broken("z-ai/glm-5.2", "baseten/fp8") is False
+    assert cd.is_skipped("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+async def test_input_cap_patterns_replace_the_builtin_set() -> None:
+    """The field is the whole list, not an extension: narrowing it to one signature
+    stops the other built-in signature from classifying a 400."""
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(
+        _entry("baseten/fp8", ("baseten/fp8",)),
+        cooldown=cd,
+        input_cap_patterns=("maximum context length",),
+    )
+
+    class _Exc:
+        status_code = 400
+
+        def __str__(self) -> str:
+            return "Input length 562514 exceeds the maximum allowed input length of 524256 tokens"
+
+    kwargs = _failure_kwargs("baseten/fp8", _Exc())
+    await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
+    assert cd.is_input_capped("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+async def test_input_cap_patterns_empty_disables_the_check() -> None:
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(
+        _entry("baseten/fp8", ("baseten/fp8",)),
+        cooldown=cd,
+        input_cap_patterns=(),
+    )
+
+    class _Exc:
+        status_code = 400
+
+        def __str__(self) -> str:
+            return "This model's maximum context length is 200000 tokens"
+
+    kwargs = _failure_kwargs("baseten/fp8", _Exc())
+    await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
+    assert cd.is_input_capped("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+async def test_input_cap_wins_over_broken_when_both_match() -> None:
+    """Precedence matters: input cap is a bounded soft skip the request caused, so a body
+    matching both must not be promoted to a hard broken-provider exclusion."""
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(
+        _entry("baseten/fp8", ("baseten/fp8",)),
+        cooldown=cd,
+        input_cap_patterns=("maximum context length",),
+        broken_provider_patterns=("maximum context length",),
+    )
+
+    class _Exc:
+        status_code = 400
+
+        def __str__(self) -> str:
+            return "This model's maximum context length is 200000 tokens"
+
+    kwargs = _failure_kwargs("baseten/fp8", _Exc())
+    await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
+    assert cd.is_input_capped("z-ai/glm-5.2", "baseten/fp8") is True
+    assert cd.is_broken("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+async def test_broken_winner_is_skipped_for_new_request() -> None:
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(
+        _entry("baseten/fp8", ("baseten/fp8", "novita/fp8")),
+        cooldown=cd,
+        wildcard=True,
+        broken_provider_patterns=("provider returned error",),
+    )
+    cd.record_broken("z-ai/glm-5.2", "baseten/fp8", ttl_s=600.0)
+    result = await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert _provider_only(result[0]) == "novita/fp8"
+
+
+async def test_broken_provider_is_a_hard_skip_unlike_input_cap() -> None:
+    """An input-capped provider is still tried when nothing else is left; a broken one is
+    not. A provider the operator has declared misconfigured will not serve the request,
+    so routing to it wastes the call."""
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(
+        _entry("baseten/fp8", ("baseten/fp8",)),
+        cooldown=cd,
+        wildcard=True,
+        broken_provider_patterns=("provider returned error",),
+    )
+    cd.record_broken("z-ai/glm-5.2", "baseten/fp8", ttl_s=600.0)
+    with pytest.raises(AllProvidersOnCooldown) as exc:
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    message = str(exc.value)
+    assert "marked broken by a 400 pattern" in message
+    assert "429 cooldown" not in message
+
+
+async def test_broken_provider_ttl_from_rule_expires() -> None:
+    """The TTL is read off the rule at record time, so a short one lets the provider back
+    in without a restart."""
+    clock = {"t": 0.0}
+    cd = RateLimitCooldown(threshold=10, clock=lambda: clock["t"])
+    cb, _ = _callback(
+        _entry("baseten/fp8", ("baseten/fp8",)),
+        cooldown=cd,
+        broken_provider_patterns=("provider returned error",),
+        broken_provider_ttl_s=60.0,
+    )
+
+    class _Exc:
+        status_code = 400
+
+        def __str__(self) -> str:
+            return "Provider returned error"
+
+    kwargs = _failure_kwargs("baseten/fp8", _Exc())
+    await cb.async_log_failure_event(kwargs, None, 0.0, 0.0)
+    assert cd.is_broken("z-ai/glm-5.2", "baseten/fp8") is True
+    clock["t"] = 60.1
+    assert cd.is_broken("z-ai/glm-5.2", "baseten/fp8") is False
+
+
+async def test_broken_provider_detected_on_passthrough_failure() -> None:
+    """The passthrough path supplies a synthetic exception whose text says nothing, so
+    the upstream body in request_data["response_body"] is what the pattern must see."""
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(
+        _entry("baseten/fp8", ("baseten/fp8",)),
+        cooldown=cd,
+        broken_provider_patterns=("invalid provider config",),
+    )
+    request_data = _post_call_request_data(
+        "baseten/fp8",
+        response_body={"error": {"message": "Invalid provider config for this model"}},
+    )
+    await cb.async_post_call_failure_hook(
+        request_data, _SyntheticUpstreamExc(400), None
+    )
+    assert cd.is_broken("z-ai/glm-5.2", "baseten/fp8") is True
+
+
+async def test_broken_cold_start_fallback_raises_and_names_the_pattern() -> None:
+    cd = RateLimitCooldown(threshold=10)
+    cb, _ = _callback(
+        None,
+        wildcard=True,
+        cold_start_fallback=("novita/fp8",),
+        cooldown=cd,
+        broken_provider_patterns=("provider returned error",),
+    )
+    cd.record_broken("z-ai/glm-5.2", "novita/fp8", ttl_s=600.0)
+    with pytest.raises(AllProvidersOnCooldown) as exc:
+        await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    assert "marked broken by a 400 pattern" in str(exc.value)
+
+
+async def test_broken_winner_records_provider_broken_decision(tmp_path, monkeypatch) -> None:
+    """The routing log names the cause an operator must act on, rather than reporting the
+    skip as a generic safe_set move."""
+    log = tmp_path / "routing.log"
+    monkeypatch.setenv("OPENROUTER_PARETO_ROUTING_LOG", str(log))
+    rules = {
+        "z-ai/glm-5.2": rule(
+            precision="fp8",
+            min_context=1_000_000,
+            min_stats_requests=100,
+            wildcard=True,
+            log_decisions=True,
+            broken_provider_patterns=["provider returned error"],
+        )
+    }
+    cd = RateLimitCooldown(threshold=10)
+    cb = OpenRouterParetoCallback(
+        rules=rules, telemetry=_StubTelemetry(_entry("baseten/fp8", ("baseten/fp8", "novita/fp8"))), cooldown=cd
+    )
+    cd.record_broken("z-ai/glm-5.2", "baseten/fp8", ttl_s=600.0)
+    await cb.async_filter_deployments("z-ai/glm-5.2", [_wildcard_dep()], None)
+    text = log.read_text()
+    assert "decision=provider_broken" in text
+    assert "slug=novita/fp8" in text

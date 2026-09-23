@@ -9,6 +9,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, TypeAdapter, field_validator, model_validator
 
+from .cooldown import BROKEN_PROVIDER_TTL_S, validate_patterns
+
 
 def _coerce_str_tuple(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
     if isinstance(value, str):
@@ -27,6 +29,29 @@ def _normalize_regions(value: str | tuple[str, ...] | list[str]) -> tuple[str, .
     it is not this plugin's place to police which strings are valid country codes."""
     codes = tuple(r.strip().upper() for r in _coerce_str_tuple(value) if r.strip())
     return tuple(dict.fromkeys(codes))
+
+
+def _normalize_providers(value: str | tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    """Strip, lowercase, and dedupe preserving order.
+
+    Unlike `_normalize_regions`, this folds case. OpenRouter provider slugs are
+    lowercase by construction (they are slugs, not display names), so folding cannot
+    turn a non-match into a match - it only rescues an operator who wrote `Novita`. The
+    asymmetry is deliberate: a mis-cased region string fails loudly as a region nothing
+    matches, whereas a mis-cased slug would silently fail to exclude the provider the
+    operator meant to exclude."""
+    slugs = tuple(s.strip().lower() for s in _coerce_str_tuple(value) if s.strip())
+    return tuple(dict.fromkeys(slugs))
+
+
+def _resolve_patterns(patterns: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...] | None:
+    """A rule's pattern list, or None for 'unset'. None is distinct from an empty tuple:
+    None keeps the built-in heuristics, () switches the check off. Resolving None to the
+    built-ins happens where the patterns are used, so the built-in set stays owned by the
+    module that matches against it."""
+    if patterns is None:
+        return None
+    return _coerce_str_tuple(patterns)
 
 
 def _reject_bool(v: object, *, integer: bool = False) -> object:
@@ -62,6 +87,10 @@ class Rule:
     unverified_region_policy: UnverifiedRegionPolicy = "no_route"
     strict_provider: bool = False
     max_price: float | None = None
+    exclude_providers: tuple[str, ...] = ()
+    input_cap_patterns: tuple[str, ...] | None = None
+    broken_provider_patterns: tuple[str, ...] = ()
+    broken_provider_ttl_s: float = BROKEN_PROVIDER_TTL_S
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "precision", _coerce_str_tuple(self.precision))
@@ -72,6 +101,26 @@ class Rule:
             _coerce_str_tuple(self.cold_start_fallback),
         )
         object.__setattr__(self, "exclude_regions", _normalize_regions(self.exclude_regions))
+        object.__setattr__(self, "exclude_providers", _normalize_providers(self.exclude_providers))
+        object.__setattr__(self, "input_cap_patterns", _resolve_patterns(self.input_cap_patterns))
+        object.__setattr__(
+            self,
+            "broken_provider_patterns",
+            _resolve_patterns(self.broken_provider_patterns) or (),
+        )
+        for field_name, patterns in (
+            ("input_cap_patterns", self.input_cap_patterns),
+            ("broken_provider_patterns", self.broken_provider_patterns),
+        ):
+            if patterns is not None:
+                validate_patterns(patterns, field=field_name)
+        # `bool` is an `int` subclass, so `broken_provider_ttl_s: true` would otherwise
+        # install a one-second TTL from a typo.
+        ttl = self.broken_provider_ttl_s
+        if isinstance(ttl, bool) or not isinstance(ttl, (int, float)):
+            raise ValueError(f"broken_provider_ttl_s must be a number, not {type(ttl).__name__}")
+        if not math.isfinite(ttl) or ttl <= 0:
+            raise ValueError(f"broken_provider_ttl_s must be a finite > 0 (got {ttl!r})")
         if self.unverified_region_policy not in _UNVERIFIED_REGION_POLICIES:
             raise ValueError(
                 f"unverified_region_policy must be one of "
@@ -101,6 +150,10 @@ def rule(
     unverified_region_policy: UnverifiedRegionPolicy = "no_route",
     strict_provider: bool = False,
     max_price: float | None = None,
+    exclude_providers: str | tuple[str, ...] | list[str] = (),
+    input_cap_patterns: str | tuple[str, ...] | list[str] | None = None,
+    broken_provider_patterns: str | tuple[str, ...] | list[str] = (),
+    broken_provider_ttl_s: float = BROKEN_PROVIDER_TTL_S,
 ) -> Rule:
     return Rule(
         precision=_coerce_str_tuple(precision),
@@ -117,6 +170,10 @@ def rule(
         unverified_region_policy=unverified_region_policy,
         strict_provider=strict_provider,
         max_price=max_price,
+        exclude_providers=_coerce_str_tuple(exclude_providers),
+        input_cap_patterns=_resolve_patterns(input_cap_patterns),
+        broken_provider_patterns=_coerce_str_tuple(broken_provider_patterns),
+        broken_provider_ttl_s=broken_provider_ttl_s,
     )
 
 
@@ -136,6 +193,17 @@ class RuleSpec(BaseModel):
     unverified_region_policy: UnverifiedRegionPolicy = "no_route"
     strict_provider: bool = False
     max_price: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    exclude_providers: list[str] = Field(default_factory=list[str])
+    # `None` and `[]` are different requests: unset keeps the built-in input-cap
+    # heuristics, an explicit empty list switches the check off.
+    input_cap_patterns: list[str] | None = None
+    broken_provider_patterns: list[str] = Field(default_factory=list[str])
+    broken_provider_ttl_s: float = Field(default=BROKEN_PROVIDER_TTL_S, gt=0, allow_inf_nan=False)
+
+    @field_validator("broken_provider_ttl_s", mode="before")
+    @classmethod
+    def _ttl_no_bool(cls, v: object) -> object:
+        return _reject_bool(v)
 
     @field_validator("precision")
     @classmethod
@@ -168,6 +236,10 @@ class RuleSpec(BaseModel):
             unverified_region_policy=self.unverified_region_policy,
             strict_provider=self.strict_provider,
             max_price=self.max_price,
+            exclude_providers=self.exclude_providers,
+            input_cap_patterns=self.input_cap_patterns,
+            broken_provider_patterns=self.broken_provider_patterns,
+            broken_provider_ttl_s=self.broken_provider_ttl_s,
         )
 
 
@@ -175,7 +247,16 @@ def rule_fingerprint(r: Rule) -> str:
     """Stable digest of every field that changes candidate eligibility or winner
     selection. A cached selection is only reusable by a process whose rule has the
     same fingerprint, so one worker's permissive winner cannot leak into a stricter
-    worker via the shared cache file."""
+    worker via the shared cache file.
+
+    `exclude_providers` belongs here: it drops candidates, so a cached winner chosen
+    under a rule that did not exclude it must not be served to one that does.
+
+    The failure-classification fields deliberately do NOT: `input_cap_patterns`,
+    `broken_provider_patterns`, and `broken_provider_ttl_s` change which failures are
+    recorded at request time, never which candidates a selection contains. Hashing them
+    would orphan every cached entry for the model, and re-fetch the whole telemetry
+    snapshot, each time an operator broadened a regex."""
     payload = json.dumps(
         {
             "precision": list(r.precision),
@@ -187,6 +268,7 @@ def rule_fingerprint(r: Rule) -> str:
             "allow_unknown_region": r.allow_unknown_region,
             "unverified_region_policy": r.unverified_region_policy,
             "max_price": r.max_price,
+            "exclude_providers": list(r.exclude_providers),
         },
         sort_keys=True,
         separators=(",", ":"),

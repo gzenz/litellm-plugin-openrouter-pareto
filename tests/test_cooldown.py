@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 from litellm_plugin_openrouter_pareto.cooldown import RATE_LIMIT_WINDOW_S, RateLimitCooldown
 
 
@@ -85,14 +87,93 @@ def test_input_cap_is_one_shot_not_windowed() -> None:
     assert cd.is_skipped("z-ai/glm-5.2", "baseten/fp8") is True
 
 
-def test_is_input_cap_error_matches_base_ten_message() -> None:
-    from litellm_plugin_openrouter_pareto.cooldown import is_input_cap_error
+def test_matches_400_matches_base_ten_message() -> None:
+    from litellm_plugin_openrouter_pareto.cooldown import (
+        DEFAULT_INPUT_CAP_PATTERNS,
+        matches_400,
+    )
 
     msg = "Input length 562514 exceeds the maximum allowed input length of 524256 tokens"
-    assert is_input_cap_error(400, msg) is True
-    assert is_input_cap_error(400, "This model's maximum context length is 200000 tokens") is True
-    assert is_input_cap_error(400, "some other bad request") is False
-    assert is_input_cap_error(429, "rate limit") is False
+    assert matches_400(DEFAULT_INPUT_CAP_PATTERNS, 400, msg) is True
+    assert (
+        matches_400(DEFAULT_INPUT_CAP_PATTERNS, 400, "This model's maximum context length is 200000 tokens")
+        is True
+    )
+    assert matches_400(DEFAULT_INPUT_CAP_PATTERNS, 400, "some other bad request") is False
+    assert matches_400(DEFAULT_INPUT_CAP_PATTERNS, 429, "rate limit") is False
+
+
+def test_matches_400_is_scoped_to_400() -> None:
+    """A 500 whose body happens to carry a matched phrase is not evidence for either
+    classification: the two callers ask about a request-shaped condition and a
+    provider-shaped one, and neither is a statement about a server error."""
+    from litellm_plugin_openrouter_pareto.cooldown import matches_400
+
+    patterns = (r"provider returned error",)
+    assert matches_400(patterns, 500, "provider returned error") is False
+    assert matches_400(patterns, 404, "provider returned error") is False
+    assert matches_400(patterns, 400, "provider returned error") is True
+
+
+def test_matches_400_empty_patterns_matches_nothing() -> None:
+    """An empty pattern list is how a rule switches a check off, so it must not fall
+    back to the built-ins or to a match-everything regex."""
+    from litellm_plugin_openrouter_pareto.cooldown import matches_400
+
+    assert matches_400((), 400, "maximum context length exceeded") is False
+
+
+def test_validate_patterns_rejects_empty_pattern() -> None:
+    """An empty pattern matches every body, so it would mark every provider of the
+    model broken. Rejected at rule construction instead."""
+    from litellm_plugin_openrouter_pareto.cooldown import validate_patterns
+
+    with pytest.raises(ValueError, match="empty pattern"):
+        validate_patterns(("ok", "   "), field="broken_provider_patterns")
+
+
+def test_validate_patterns_rejects_invalid_regex() -> None:
+    from litellm_plugin_openrouter_pareto.cooldown import validate_patterns
+
+    with pytest.raises(ValueError, match="invalid regex"):
+        validate_patterns(("unclosed (group",), field="input_cap_patterns")
+
+
+def test_record_broken_makes_skipped_and_expires() -> None:
+    clock = {"t": 0.0}
+    cd = RateLimitCooldown(clock=lambda: clock["t"])
+    cd.record_broken("m", "bad/fp8", ttl_s=600.0)
+    assert cd.is_broken("m", "bad/fp8") is True
+    assert cd.is_skipped("m", "bad/fp8") is True
+    clock["t"] = 600.1
+    assert cd.is_broken("m", "bad/fp8") is False
+    assert "m\x00bad/fp8" not in cd._broken, "expired broken key was not reaped"
+
+
+def test_broken_ttl_is_per_call() -> None:
+    """The TTL is a per-rule setting, so it is resolved when the hit is recorded rather
+    than held on the store: two rules sharing one store keep their own windows."""
+    clock = {"t": 0.0}
+    cd = RateLimitCooldown(clock=lambda: clock["t"])
+    cd.record_broken("m", "short/fp8", ttl_s=60.0)
+    cd.record_broken("m", "long/fp8", ttl_s=600.0)
+    clock["t"] = 100.0
+    assert cd.is_broken("m", "short/fp8") is False
+    assert cd.is_broken("m", "long/fp8") is True
+
+
+def test_broken_is_model_scoped() -> None:
+    cd = RateLimitCooldown()
+    cd.record_broken("model-a", "shared/fp8", ttl_s=600.0)
+    assert cd.is_broken("model-a", "shared/fp8") is True
+    assert cd.is_broken("model-b", "shared/fp8") is False
+
+
+def test_empty_slug_is_noop_for_broken() -> None:
+    cd = RateLimitCooldown()
+    cd.record_broken("m", "", ttl_s=600.0)
+    assert cd.is_broken("m", "") is False
+
 
 
 def test_model_scoped_isolation_429() -> None:

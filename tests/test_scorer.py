@@ -272,6 +272,111 @@ def test_max_price_rejects_bool_and_string() -> None:
     assert RuleSpec.model_validate({"max_price": 2}).max_price == 2.0
 
 
+def test_exclude_providers_drops_full_slug() -> None:
+    """An entry naming one endpoint removes exactly that endpoint: same org, other
+    variants still eligible."""
+    stats, ups = _live_fixtures()
+    r = rule(
+        precision="fp8",
+        min_context=1_000_000,
+        min_stats_requests=100,
+        exclude_providers=["novita/fp8"],
+    )
+    sel = select_candidates(stats, ups, r)
+    slugs = {c.slug for c in sel.candidates} | set(sel.safe_set)
+    assert "novita/fp8" not in slugs
+    assert "siliconflow/fp8" in slugs
+
+
+def test_exclude_providers_org_base_drops_every_endpoint() -> None:
+    """An entry naming an org removes every endpoint that org offers, without needing a
+    wildcard syntax to say so."""
+    stats, ups = _live_fixtures()
+    r = rule(
+        precision="fp8",
+        min_context=1_000_000,
+        min_stats_requests=100,
+        exclude_providers=["novita"],
+    )
+    sel = select_candidates(stats, ups, r)
+    slugs = {c.slug for c in sel.candidates} | set(sel.safe_set)
+    assert not any(s.startswith("novita/") for s in slugs)
+    assert "siliconflow/fp8" in slugs
+
+
+def test_exclude_providers_empty_is_no_filtering() -> None:
+    """The default is an empty blocklist, so behaviour is unchanged for every existing
+    rule."""
+    stats, ups = _live_fixtures()
+    base = select_candidates(stats, ups, _glm_rule())
+    excluded = select_candidates(
+        stats,
+        ups,
+        rule(precision="fp8", min_context=1_000_000, min_stats_requests=100, exclude_providers=[]),
+    )
+    assert {c.slug for c in base.candidates} == {c.slug for c in excluded.candidates}
+
+
+def test_exclude_providers_is_case_and_whitespace_insensitive() -> None:
+    """OR slugs are lowercase by construction, so folding case cannot create a false
+    match - it only rescues a mis-cased entry, which would otherwise silently fail to
+    exclude the provider the operator meant."""
+    stats, ups = _live_fixtures()
+    for entry in ("Novita", "  NOVITA  "):
+        r = rule(
+            precision="fp8",
+            min_context=1_000_000,
+            min_stats_requests=100,
+            exclude_providers=entry,
+        )
+        slugs = {c.slug for c in select_candidates(stats, ups, r).candidates}
+        assert not any(s.startswith("novita/") for s in slugs), entry
+
+
+def test_exclude_providers_dedupes_preserving_order() -> None:
+    r = rule(
+        precision="fp8",
+        min_context=1_000_000,
+        min_stats_requests=100,
+        exclude_providers=[" Novita ", "novita", "baseten/fp8"],
+    )
+    assert r.exclude_providers == ("novita", "baseten/fp8")
+
+
+def test_rule_fingerprint_includes_exclude_providers() -> None:
+    """The blocklist changes candidate eligibility, so a cached winner chosen without it
+    must not be served to a rule that has it."""
+    from litellm_plugin_openrouter_pareto.config import rule_fingerprint
+
+    base = rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)
+    differs = rule(
+        precision="fp8",
+        min_context=1_000_000,
+        min_stats_requests=100,
+        exclude_providers=["novita/fp8"],
+    )
+    assert rule_fingerprint(base) != rule_fingerprint(differs)
+
+
+def test_rule_fingerprint_ignores_failure_classification_fields() -> None:
+    """The 400 patterns and their TTL change what is recorded at request time, never
+    which candidates a selection contains. Hashing them would orphan every cached entry
+    for the model, and re-fetch the whole telemetry snapshot, each time an operator
+    broadened a regex."""
+    from litellm_plugin_openrouter_pareto.config import rule_fingerprint
+
+    base = rule(precision="fp8", min_context=1_000_000, min_stats_requests=100)
+    same = rule(
+        precision="fp8",
+        min_context=1_000_000,
+        min_stats_requests=100,
+        input_cap_patterns=["exceeds the maximum"],
+        broken_provider_patterns=["provider returned error"],
+        broken_provider_ttl_s=60.0,
+    )
+    assert rule_fingerprint(base) == rule_fingerprint(same)
+
+
 def test_rule_fingerprint_includes_max_price() -> None:
     """max_price changes candidate eligibility, so it must invalidate a cached
     winner: a tighter ceiling has a different fingerprint than a looser one."""

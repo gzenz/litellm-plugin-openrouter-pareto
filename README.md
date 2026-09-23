@@ -11,10 +11,16 @@ choice does not thrash.
 
 - **Route to the best-value provider.** Per request, narrow a model group to the one
   OpenRouter provider that wins the price-vs-throughput value walk.
+- **Cap the price you will pay.** Drop providers above a per-million-token input price
+  ceiling before the value walk.
 - **Reroute around rate-limited providers.** A provider that keeps returning 429 is
   skipped for new requests until its rate limits clear.
 - **Skip providers that reject oversized input.** A provider that 400s on a too-large
   prompt is remembered and skipped, so later requests route around it.
+- **Skip providers you have declared broken.** A 400 whose body matches a signature you
+  supply marks that provider misconfigured and routes around it until you fix it.
+- **Exclude providers outright.** A static blocklist of provider slugs that are never
+  candidates, by full slug or by org.
 - **Exclude providers by region.** Keep a model off providers based in or serving from
   regions you name (best-effort, from OpenRouter's reported geography).
 - **Make routing authoritative.** Optionally reject requests that try to pin their own
@@ -32,8 +38,9 @@ zero-data-retention, no-provider-fallback posture (`zdr: true`,
 unchanged, so set `zdr: true, allow_fallbacks: false` in each pin (as the pinned-mode
 example does) if you want that posture there.
 
-Each use case below is opt-in through a per-model rule; the sections show the config
-for each. Start with install and the quick start, then add the rules you need.
+The 429, input-cap, and account-allowlist behaviors are on for any model with a rule;
+the rest are opt-in through that rule's fields. The sections below show the config for
+each. Start with install and the quick start, then add the rules you need.
 
 ## Install
 
@@ -76,8 +83,8 @@ model_list:
       id: or-wildcard
 ```
 
-That is enough to get best-value routing plus the 429 and input-cap fallbacks, which
-are always on for a managed model. The sections below cover each use case in turn.
+That is enough to get best-value routing, plus the 429 and input-cap handling that is on
+by default for any managed model.
 
 ## Use case: route to the best-value provider
 
@@ -135,6 +142,29 @@ Pinned mode gives you an explicit allowlist of providers; wildcard mode trades t
 for zero maintenance and instant availability of new providers. Use pinned when you
 want to curate exactly which providers a model may touch.
 
+## Use case: cap the price you will pay
+
+`max_price` sets a ceiling in USD per million input tokens. A provider endpoint above it
+is dropped from the candidate list before the value walk, so it can be neither the winner
+nor a fallback from the scored set.
+
+```yaml
+litellm_settings:
+  openrouter_pareto_rules:
+    "z-ai/glm-5.2":
+      max_price: 1.5
+```
+
+This is an absolute bound, not a preference. `value_regression_tolerance` lets a pricier
+provider win on speed; a provider over `max_price` is never selected at any tolerance.
+
+One exception worth knowing: `cold_start_fallback` is operator-vetted and bypasses
+scoring, so a slug listed there is pinned regardless of price. Keep that list under the
+ceiling yourself.
+
+`max_price` is part of the rule fingerprint, so changing the ceiling discards the cached
+selection for that model.
+
 ## Use case: reroute around rate-limited providers (429)
 
 Always on for a managed model. A provider returning HTTP 429 is treated as a
@@ -155,15 +185,17 @@ transitory upstream rate limit, handled in two layers:
   lacks; it stops a persistently rate-limited winner from being retried first on
   every new request.
 
-The cross-request cooldown is in-process and not persisted; it resets on restart.
-When every provider in the safe set is hot, the plugin raises
-`AllProvidersOnCooldown` (surfaced to the caller as a failed request) rather than
-re-pinning a known-failing provider or ceding to OpenRouter's own selection, which
-would bypass `max_price`, `exclude_regions`, and the precision/context filters. A
-single non-hot provider in the safe set is still pinned; only an all-429-hot (or
-all-allowlist-disallowed) list
-stops routing. Input caps never raise this - a capped provider is still tried (a
-small request may succeed under the cap), and only the 429 cooldown is a hard stop.
+When nothing in the safe set is usable, the plugin raises `AllProvidersOnCooldown` (the
+router surfaces it as a failed request) rather than re-pinning a known-failing provider or
+ceding to OpenRouter's own selection, which would bypass `max_price`, `exclude_regions`,
+and the precision/context filters. A single usable provider is still pinned. The exception
+names which cause applied - a 429 cooldown, the account allowlist, `exclude_providers`, or
+`broken_provider_patterns` - because reporting any of the others as a rate limit sends an
+operator after 429s that never happened.
+
+Input caps never raise this: a capped provider is still tried, since a small request may
+succeed under the cap. Every other unusable state is a hard stop.
+
 The fallback continues the pareto walk by re-running it: each unavailable provider is
 removed and the walk re-run over what remains, so the fallback is what the value walk
 would have chosen had the earlier picks been gone.
@@ -201,13 +233,32 @@ the next section). These are independent knobs: `RateLimitErrorRetries` governs 
 Always on for a managed model. Some providers advertise a context they cannot actually
 accept as input (e.g. BaseTen's `baseten/fp8` lists 1M context but caps input at ~524K
 tokens, 400'ing any larger request regardless of `max_tokens`). On a 400 whose body
-matches "exceeds the maximum ... length" or "maximum context length", the provider
-slug is marked input-capped and skipped for the winner pick on later requests. One
-observation is enough to start skipping it.
+matches the built-in signatures - `exceeds the maximum ... length` or
+`maximum context length` - the provider slug is marked input-capped and skipped for the
+winner pick on later requests. One observation is enough to start skipping it.
 
-The skip lasts one hour (`INPUT_CAP_TTL_S`), then the provider is retried. A workload
-that keeps sending oversized prompts will re-cap it each hour, costing one wasted 400
-per provider per hour; a workload whose prompts have shrunk lets it back in.
+The signatures are regexes, and `input_cap_patterns` replaces the built-in set. Set it
+when your provider words the error differently:
+
+```yaml
+litellm_settings:
+  openrouter_pareto_rules:
+    "z-ai/glm-5.2":
+      input_cap_patterns:
+        - "maximum context length"
+        - "input is too long"
+```
+
+The field is the whole list, not an extension: narrowing it to one signature stops the
+other built-in signature from classifying anything. An explicit empty list
+(`input_cap_patterns: []`) switches the check off; omitting the field keeps the built-in
+set. A pattern that is not a valid regex, or is empty, is rejected at first use - an
+empty pattern matches every body and would cap a provider on any 400 at all.
+
+The skip lasts one hour by default (`input_cap_ttl_s`; see Cooldown tuning), then the
+provider is retried. A workload that keeps sending oversized prompts will re-cap it each
+hour, costing one wasted 400 per provider per hour; a workload whose prompts have shrunk
+lets it back in.
 
 Unlike a 429, LiteLLM does **not** retry a 400 by default, so the same-request reroute
 is not automatic. To get the per-request walk on a too-large 400, add a retry policy
@@ -221,9 +272,80 @@ litellm_settings:
 ```
 
 Without this, the first oversized request to a capped provider fails (one wasted call),
-and subsequent requests route around it via the cooldown. The input-cap state is
-per-process and also resets on restart; with multiple workers each worker re-learns
-independently.
+and subsequent requests route around it via the cooldown.
+
+Known limitation: classifying the 400 needs the upstream error body. A **streaming
+passthrough** request does not carry it (reading the stream body would consume it and
+break the relay), so a too-large 400 on that path is not classified and the provider is
+not capped. Non-streaming passthrough and the completion paths do carry it.
+
+## Use case: skip a misconfigured provider (400)
+
+A provider can be broken rather than busy: a bad deployment, a model variant it cannot
+actually serve, an upstream routing failure. Those surface as 400s too, but unlike an
+input cap the fault is the provider's, so the fix is to stop routing to it.
+
+This is **off by default and opt-in per rule**, because a 400 cannot be attributed to the
+provider from the status code alone. Most 400s are the caller's bad request, and the
+plugin pins exactly one provider per request, so a client retry loop with a malformed
+payload would hit the same provider every time and blacklist a healthy one. You supply
+the signature instead:
+
+```yaml
+litellm_settings:
+  openrouter_pareto_rules:
+    "z-ai/glm-5.2":
+      broken_provider_patterns:
+        - "provider returned error"
+        - "invalid provider config"
+      broken_provider_ttl_s: 3600
+```
+
+A 400 whose body matches marks that slug broken and skips it for
+`broken_provider_ttl_s` (default 3600s). Unlike an input cap this is a **hard** skip:
+where an input-capped provider is still tried when nothing else is left, a broken one is
+never tried, since the operator has declared it cannot serve the request. It is also not
+a rate limit, and the routing log says so - the decision records as
+`decision=provider_broken`, and if every provider is broken the raise names the pattern
+rather than reporting a 429 that never happened.
+
+Get the real error text before writing a pattern: set `log_errors: true`, or read the
+upstream body OpenRouter returns. A pattern guessed from the wrong wording matches
+nothing and the provider keeps being selected.
+
+Precedence: if a body matches both `input_cap_patterns` and `broken_provider_patterns`,
+the input cap wins. An input cap is a condition the request caused and a bounded soft
+skip, so it must not be promoted to a hard exclusion.
+
+## Use case: exclude a provider outright
+
+`exclude_providers` is the static blocklist: providers that are never candidates,
+whether or not they have failed yet. It takes effect at selection time (the scorer drops
+them before the value walk) and on every later fallback path, so an excluded provider
+cannot be pinned via the winner, the safe set, `cold_start_fallback`, or a pinned-mode
+deployment.
+
+```yaml
+litellm_settings:
+  openrouter_pareto_rules:
+    "z-ai/glm-5.2":
+      exclude_providers:
+        - novita            # every endpoint of this org
+        - baseten/fp16      # one endpoint only
+```
+
+An entry matches either the full slug (`baseten/fp16`, one endpoint) or the org base
+(`novita`, every endpoint of that org), so both granularities are available without a
+separate syntax. Entries are stripped, case-folded, and deduped on load.
+
+An excluded provider is dropped from the candidate list, so the routing log records an
+ordinary `safe_set` decision for whichever provider takes its place, without naming the
+exclusion. That asymmetry with `provider_broken` is deliberate: a runtime discovery is
+news to the operator, a blocklist they just wrote is not.
+
+This is not the same as the account allowlist below: `exclude_providers` is your policy
+and applies immediately, while the allowlist is OpenRouter's account setting, discovered
+from an error when a request is refused.
 
 ## Use case: exclude providers by region
 
@@ -234,9 +356,6 @@ you name. For example, to keep a model off providers in Singapore:
 litellm_settings:
   openrouter_pareto_rules:
     "z-ai/glm-5.2":
-      precision: ["fp8"]
-      min_context: 1000000
-      min_stats_requests: 100
       exclude_regions: ["SG"]
       allow_unknown_region: false          # default; true keeps unknown-geography providers
       unverified_region_policy: "no_route"  # default; see the cold-start table below
@@ -312,9 +431,6 @@ To make the plugin's choice authoritative for a model, set `strict_provider: tru
 litellm_settings:
   openrouter_pareto_rules:
     "z-ai/glm-5.2":
-      precision: ["fp8"]
-      min_context: 1000000
-      min_stats_requests: 100
       strict_provider: true
 ```
 
@@ -376,7 +492,16 @@ sends the bare `z-ai/glm-5.2`, without a separate rule entry.
 | `unverified_region_policy` | `"no_route"` | Cold-start behavior under a region policy: `no_route`, `unpinned`, or `trust_fallback`. |
 | `cold_start_fallback` | `[]` | Provider slugs trusted under `trust_fallback`. |
 | `strict_provider` | `false` | `true` rejects a client-supplied `provider.only` on this model. |
-| `max_price` | `null` | Optional ceiling on input price per million tokens. A provider whose input price exceeds it is dropped before the value walk, so a runaway-priced provider can never become the winner or land in the safe set. `null` means no ceiling. |
+| `max_price` | `null` | Ceiling on input price per million tokens; see the use case above. `null` means no ceiling. |
+| `exclude_providers` | `[]` | Provider slugs that are never candidates. An entry matches the full slug (`baseten/fp16`) or the org base (`novita`, every endpoint of that org). |
+| `input_cap_patterns` | built-in | Regexes matched against a 400 body to classify it as "prompt too large". Replaces the built-in set; `[]` disables the check. |
+| `broken_provider_patterns` | `[]` | Regexes matched against a 400 body to classify the provider as misconfigured. Empty means off, which is the default. |
+| `broken_provider_ttl_s` | `3600` | How long a provider matched by `broken_provider_patterns` is skipped. |
+
+`log_errors` and `log_decisions` are the only fields here that do not affect selection;
+`input_cap_patterns`, `broken_provider_patterns`, and `broken_provider_ttl_s` affect what
+happens after a failure rather than which providers are candidates. None of the five is
+part of the cache key - see Telemetry cache below.
 
 `log_errors: true` writes to `OPENROUTER_PARETO_ERROR_LOG` (default a platformdirs user
 log path: `errors.log` under the OS log directory), created owner-only (`0o600`, no
@@ -388,12 +513,10 @@ path in production and define retention.
 `log_decisions: true` writes one line per routing decision for that model to
 `OPENROUTER_PARETO_ROUTING_LOG` (default a platformdirs user log path: `routing.log` in
 the same directory as `errors.log`), with the same owner-only, no-symlink-following
-writer as the error log. It records the decision and its reason, not the request
-outcome: litellm already logs outcomes, and correlating the two would need a request id
-plus a bounded in-process map for no added insight into the plugin's own behavior. What
-a decision-only log answers is the question the error log cannot - which branch chose
-this provider, and why - for a model that never left cold start, a request that landed on
-a pricier provider, or a region policy that silently dropped everything.
+writer as the error log. It records the decision and its reason, not the request outcome.
+What it answers is the question the error log cannot - which branch chose this provider,
+and why - for a model that never left cold start, a request that landed on a pricier
+provider, or a region or blocklist policy that silently dropped everything.
 
 ```
 2026-09-21T14:02:11+00:00 model=z-ai/glm-5.2 mode=wildcard slug=novita/fp8 decision=safe_set region=allowed
@@ -404,15 +527,16 @@ a pricier provider, or a region policy that silently dropped everything.
 | `model` | The rule key, after `openrouter/` prefix and `[...]` tag normalization. |
 | `mode` | `wildcard` (winner injected per request) or `pinned` (narrowed among deployments). |
 | `slug` | The provider pinned, or `-` when none was (declined, or deliberately unpinned). |
-| `decision` | The branch that chose it: `winner`, `safe_set`, `input_cap`, `cold_start`, `all_hot`, `unpinned`, `declined`, `pass_through`. |
+| `decision` | The branch that chose it: `winner`, `safe_set`, `input_cap`, `provider_broken`, `cold_start`, `all_hot`, `unpinned`, `declined`, `pass_through`. |
 | `region` | The region verdict for that slug: `allowed`, `excluded`, `unknown`, or `-` when the rule has no `exclude_regions`. |
 
 The reasons are a closed set, one per terminal exit, so a branch cannot be added without
 naming how it chose:
 
 - `winner` - the value-walk winner, off cooldown and input-capped only as a preference.
-- `safe_set` - the winner was unusable (cooldown, allowlist), so the walk was re-run and the next preferred provider was taken.
+- `safe_set` - the winner was unusable (cooldown, allowlist, or `exclude_providers`), so the walk was re-run and the next preferred provider was taken.
 - `input_cap` - every non-hot candidate had a recorded input cap; the winner among them is still preferred (better to try than to fail).
+- `provider_broken` - the cached winner is currently marked broken (a 400 body matched `broken_provider_patterns`), so the walk moved past it. Unique among the reasons in describing the provider that was *rejected* rather than the one chosen, and it states that provider's recorded state rather than a causal claim - a winner that is also 429-hot is reported here too. It is called out because it is the only skip cause an operator has to act on: a cooldown expires, a region verdict is a policy, but a broken provider stays broken until someone fixes or unblocks it.
 - `cold_start` - no usable telemetry entry, so an operator-vetted `cold_start_fallback` provider was pinned.
 - `all_hot` - every eligible provider was 429-hot; logged before `AllProvidersOnCooldown` is raised, since no request ever reaches a success hook on that path.
 - `unpinned` - `unverified_region_policy: unpinned` deliberately ceded provider choice to OpenRouter.
@@ -424,9 +548,7 @@ telemetry, and `region` is derived geography - the same redaction posture as the
 log, which is the one that does carry error bodies.
 
 Like `log_errors`, this is off by default and gated per rule, so enabling it for one
-model does not log the others. It is deliberately not part of the rule fingerprint: the
-flag cannot change candidate eligibility or winner selection, and folding it in would
-invalidate the shared selection cache for every worker that toggles logging.
+model does not log the others.
 
 ## Telemetry SSL
 
@@ -452,12 +574,26 @@ LiteLLM connects to OpenRouter for model traffic. A bad `ssl_ca_cert` path surfa
 a telemetry degradation warning (stale or no winner) and the plugin falls back to the
 healthy deployment set unchanged - it never raises into the request path.
 
+## Telemetry cache
+
+Selection is recomputed per request from a cached OpenRouter snapshot that is refreshed
+on a 5-minute poll, so a provider that stops passing the hard filters drops out on the
+next poll.
+
+Each rule's entry is keyed by a fingerprint of the fields that change candidate
+eligibility or winner selection (`precision`, `min_context`, `exclude_regions`,
+`exclude_providers`, `max_price`, and so on - not the `log_*` flags or the 400 patterns).
+Two workers with different policies for the same model therefore neither inherit nor
+evict each other's cached selection. The cache is written off the request path and pruned
+by a retention window.
+
 ## Cooldown tuning
 
-The 429 cross-request cooldown and the input-cap skip share one global (not per-model)
-cooldown store, so their window, threshold, and TTL are process-wide properties of
-rate-limit handling. They are tunable under `litellm_settings.openrouter_pareto_cooldown`
-or the `OPENROUTER_PARETO_COOLDOWN` JSON env var (unknown fields raise at first use):
+The 429 cooldown, the input-cap skip, and the broken-provider skip share one global (not
+per-model) store. The 429 window and threshold and the input-cap TTL are process-wide and
+tunable here; `broken_provider_ttl_s` is per rule instead (see the misconfigured-provider
+use case). Settings go under `litellm_settings.openrouter_pareto_cooldown` or the
+`OPENROUTER_PARETO_COOLDOWN` JSON env var (unknown fields raise at first use):
 
 ```yaml
 litellm_settings:
@@ -473,8 +609,9 @@ litellm_settings:
 | `rate_limit_threshold` | `3` | 429 count within the window that marks a provider hot and skips it as the winner. |
 | `input_cap_ttl_s` | `3600` | How long a 400 input-cap skip lasts before the provider is eligible again, in seconds. |
 
-The cooldown is in-process and not persisted; it resets on restart, and with multiple
-workers each worker tracks 429s independently.
+The store is in-process and not persisted; it resets on restart, and with multiple
+workers each worker tracks failures independently. That applies to all three states, so a
+provider marked broken by one worker is not skipped by its siblings.
 
 ## Allowlist tuning
 
@@ -497,35 +634,3 @@ litellm_settings:
 The allowlist itself is persisted to the telemetry cache file, so it survives proxy
 restarts. The TTL clock starts at discovery time, not at process start, so a restart
 within the TTL window reuses the cached list without re-probing.
-
-## How selection works
-
-- Telemetry is cached and refreshed on a 5-minute poll. A new value-winner must win
-  `promotion_polls` consecutive polls before it is promoted. A winner that stops
-  passing the hard filters is evicted immediately.
-- On stale or empty telemetry, or no winner, the full healthy deployment set is
-  returned unchanged (pinned mode); in wildcard mode the cold-start fallback list is
-  walked instead. Telemetry states never narrow to an empty list on their own; only
-  `exclude_regions` can, by rejecting every healthy deployment. An
-  all-input-capped state falls back to the winner (a preference skip, not a hard
-  exclusion, since a small request may still succeed under the cap). In wildcard
-  mode the only hard stop that narrows to nothing is an all-429-hot or
-  all-allowlist-disallowed candidate list, which
-  raises `AllProvidersOnCooldown` (see the 429 use case) rather than cede to
-  OpenRouter. Pinned mode does not raise: each provider is its own litellm
-  deployment, so litellm's own per-deployment 429 cooldown already removes a
-  rate-limited deployment from the healthy set, and the plugin hands back the
-  winner if its slug is still among them.
-- If the winner is in 429 cooldown or not healthy, the value walk is re-run per
-  request over the providers still available, and the winner of that re-run is pinned;
-  unavailable providers are then removed and the walk re-run again, so the list is
-  walked in sequential-elimination order until one is not on cooldown. Re-running
-  rather than following a frontier fixed at selection time matters for two reasons:
-  `value_regression_tolerance` governs the fallback as well as the winner, and a
-  provider that was dominated by the now-unavailable winner can take over (a frontier
-  computed with the winner present would never surface it). In wildcard mode only an
-  all-429-hot or all-allowlist-disallowed list raises.
-- The telemetry cache is stored per `(model, rule)` fingerprint, so a worker configured
-  with `exclude_regions` never inherits a winner computed by a worker without it, and
-  two workers with different policies for the same model do not evict each other's
-  cache. It is persisted off the request path and pruned by a retention window.

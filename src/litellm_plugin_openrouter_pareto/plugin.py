@@ -18,13 +18,18 @@ from .config import (
     load_telemetry_config,
     telemetry_verify,
 )
-from .cooldown import RateLimitCooldown, is_input_cap_error
+from .cooldown import (
+    DEFAULT_INPUT_CAP_PATTERNS,
+    RateLimitCooldown,
+    matches_400,
+)
 from .decision_log import (
     ALL_HOT,
     COLD_START,
     DECLINED,
     INPUT_CAP,
     PASS_THROUGH,
+    PROVIDER_BROKEN,
     REGION_ALLOWED,
     REGION_EXCLUDED,
     REGION_UNKNOWN,
@@ -35,7 +40,7 @@ from .decision_log import (
     format_decision,
 )
 from .error_log import or_decision_log, or_error_log
-from .scorer import ranked_order
+from .scorer import provider_excluded, ranked_order
 from .telemetry import DEFAULT_ALLOWLIST_TTL_S, CacheEntry, Telemetry
 
 _OR_PREFIX = "or-"
@@ -57,6 +62,17 @@ def _parse_allowed_providers(message: str) -> frozenset[str] | None:
     raw = m.group(1)
     slugs = frozenset(s.strip() for s in raw.split(",") if s.strip())
     return slugs if slugs else None
+
+
+def _input_cap_patterns(rule: Rule | None) -> tuple[str, ...]:
+    """The 400-body signatures that mean "prompt too large". `None` on the rule means
+    the operator did not configure the field, which keeps the built-in heuristics; an
+    empty tuple means they configured it off. A rule of None (an unmanaged model that
+    still reached a failure hook) also gets the built-ins, matching what the plugin did
+    before the patterns were configurable."""
+    if rule is None or rule.input_cap_patterns is None:
+        return DEFAULT_INPUT_CAP_PATTERNS
+    return rule.input_cap_patterns
 
 
 def _is_no_allowed_providers_404(status: object, message: str) -> bool:
@@ -87,7 +103,7 @@ class StrictProviderConflict(ValueError):
 
 
 class AllProvidersOnCooldown(ValueError):
-    """Every candidate for a managed model is on a 429 cooldown. WILDCARD MODE ONLY:
+    """No candidate for a managed model is usable right now. WILDCARD MODE ONLY:
     pinned mode never raises it, since each provider is its own litellm deployment
     and litellm's per-deployment cooldown already removes a rate-limited one from the
     healthy set - pinned mode hands back the winner when its slug is still among them.
@@ -99,9 +115,10 @@ class AllProvidersOnCooldown(ValueError):
     router re-raises filter exceptions verbatim (same path as
     StrictProviderConflict), so this surfaces the plugin's own message. Input caps and
     region policy never raise this. The raise fires when the walk finds no usable
-    provider at all, which is an all-429-hot state OR an all-allowlist-disallowed one;
-    the message and the log name which, since reporting the latter as a rate limit
-    sends an operator after 429s that never happened."""
+    provider at all, which is an all-429-hot state, an all-allowlist-disallowed one, an
+    all-broken one, or an all-exclude_providers one; the message and the log name which,
+    since reporting any of the others as a rate limit sends an operator after 429s that
+    never happened."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -305,6 +322,19 @@ class OpenRouterParetoCallback(CustomLogger):
             return True
         return slug.split("/", 1)[0] in allowlist
 
+    def _provider_excluded(self, rule: Rule, slug: str) -> bool:
+        """Whether the rule's `exclude_providers` blocklist names this slug, in the same
+        two granularities the scorer accepts (full slug or org base) and by the same
+        comparison, so the two sides cannot disagree about which providers are excluded.
+
+        The scorer already drops these at selection time, so this is the second line of
+        defence for slugs that arrive from somewhere other than a fresh selection: the
+        operator-authored `cold_start_fallback` list, and an entry a direct caller built
+        by hand. A rule edit cannot leak one through the disk cache, since
+        `exclude_providers` is part of the rule fingerprint and an entry written under a
+        different blocklist does not match this process's cache key."""
+        return provider_excluded(slug, rule.exclude_providers)
+
     def _entry_slugs(self, entry: CacheEntry) -> tuple[str, ...]:
         """Every slug an entry can offer, so callers can precompute what to exclude."""
         if entry.points:
@@ -345,12 +375,16 @@ class OpenRouterParetoCallback(CustomLogger):
         exclude = frozenset(
             slug
             for slug in self._entry_slugs(entry)
-            if self._cooldown.is_skipped(model, slug) or not self._allowlist_allows(slug, allowlist)
+            if self._cooldown.is_skipped(model, slug)
+            or not self._allowlist_allows(slug, allowlist)
+            or self._provider_excluded(rule, slug)
         )
         return tuple(
             slug
             for slug in self._ordered_candidates(rule, entry, exclude)
-            if not self._cooldown.is_skipped(model, slug) and self._allowlist_allows(slug, allowlist)
+            if not self._cooldown.is_skipped(model, slug)
+            and self._allowlist_allows(slug, allowlist)
+            and not self._provider_excluded(rule, slug)
         )
 
     def _client_provider_only(self, request_kwargs: dict[str, object] | None) -> bool:
@@ -438,22 +472,29 @@ class OpenRouterParetoCallback(CustomLogger):
         # On 429: keep trying our own list until a provider is not on cooldown. The
         # unusable slugs are excluded BEFORE the walk, not filtered out of its result:
         # re-walking over what remains is the whole point, since a provider may be
-        # justified only by a stepping stone that is itself unavailable. Input cap is
-        # a soft preference, not a skip: prefer a non-capped provider, but if every
-        # non-hot provider is capped fall back to the first non-hot (the winner if it
-        # is not hot) - a small request may still succeed under the cap, better to try
-        # than to fail. Only an all-429-hot list is a hard stop.
-        # The reason records which of those two rules actually chose: a warm winner on
-        # cooldown means the walk was re-run past it.
+        # justified only by a stepping stone that is itself unavailable.
+        #
+        # Two states are hard skips and two are not, and the difference is who owns the
+        # fault. A 429 is hard because the provider is refusing right now. A provider
+        # matched by `broken_provider_patterns` is hard because the operator has declared
+        # a provider-side misconfiguration. A rule-excluded provider is hard by
+        # definition. Input cap is the one SOFT state: it describes a condition the
+        # request caused, so prefer a non-capped provider, but if every usable provider
+        # is capped fall back to the first (the winner if it is among them) - a small
+        # request may still fit under the cap, better to try than to fail. Only a list
+        # with no usable provider at all is a hard stop.
         allowlist = self._allowlist()
-        # Track the two reasons separately: they are excluded by the same set but are
-        # not the same problem, and an all-allowlist-disallowed state must not be
-        # reported as a rate limit - an operator would chase 429s that never happened.
+        # Track the reasons separately: they exclude the same providers but are not the
+        # same problem, and an all-allowlist-disallowed state must not be reported as a
+        # rate limit - an operator would chase 429s that never happened. Same for the
+        # two newer reasons.
         slugs = self._entry_slugs(entry)
         hot = frozenset(s for s in slugs if self._cooldown.is_hot(model, s))
+        broken = frozenset(s for s in slugs if self._cooldown.is_broken(model, s))
         disallowed = frozenset(s for s in slugs if not self._allowlist_allows(s, allowlist))
-        not_hot = self._ordered_candidates(rule, entry, hot | disallowed)
-        if not not_hot:
+        rule_excluded = frozenset(s for s in slugs if self._provider_excluded(rule, s))
+        usable = self._ordered_candidates(rule, entry, hot | broken | disallowed | rule_excluded)
+        if not usable:
             # Logged before the raise: the exception leaves async_filter_deployments
             # without ever reaching the line after the dispatch, and the router
             # re-raises it to the caller, so this is the only chance to record it.
@@ -463,28 +504,64 @@ class OpenRouterParetoCallback(CustomLogger):
                 "wildcard",
                 Decision(None, ALL_HOT, self._decline_region(model, rule, entry)),
             )
-            if hot and not disallowed:
-                detail = "every provider is on a 429 cooldown; declining to route until one clears"
-            elif disallowed and not hot:
-                detail = "every provider is disallowed by the account's allowed-providers setting; no 429 is involved"
-            else:
-                detail = "every provider is on a 429 cooldown or disallowed by the account's allowed-providers setting"
+            causes: list[str] = []
+            if hot:
+                causes.append("on a 429 cooldown")
+            if broken:
+                causes.append("marked broken by a 400 pattern")
+            if disallowed:
+                causes.append("disallowed by the account's allowed-providers setting")
+            if rule_excluded:
+                causes.append("excluded by exclude_providers")
+            detail = f"every provider is {' or '.join(causes)}"
+            # The single-cause messages name the consequence too, which the joined form
+            # above cannot: neither of these is a rate limit, and saying so is the whole
+            # point of spelling them out.
+            if hot and len(causes) == 1:
+                detail += "; declining to route until one clears"
+            elif disallowed and len(causes) == 1:
+                detail += "; no 429 is involved"
+            evidence = [
+                f"winner={entry.winner}",
+                f"safe_set={entry.safe_set}",
+                f"hot={sorted(hot)}",
+                f"disallowed={sorted(disallowed)}",
+            ]
+            if broken:
+                evidence.append(f"broken={sorted(broken)}")
+            if rule_excluded:
+                evidence.append(f"excluded={sorted(rule_excluded)}")
             raise AllProvidersOnCooldown(
-                f"openrouter-pareto: {detail} for {model}. "
-                f"winner={entry.winner} safe_set={entry.safe_set} "
-                f"hot={sorted(hot)} disallowed={sorted(disallowed)}"
+                f"openrouter-pareto: {detail} for {model}. {' '.join(evidence)}"
             )
-        not_capped = tuple(slug for slug in not_hot if not self._cooldown.is_input_capped(model, slug))
+        not_capped = tuple(slug for slug in usable if not self._cooldown.is_input_capped(model, slug))
         if not_capped:
             chosen = not_capped[0]
-            reason = WINNER if chosen == entry.winner else SAFE_SET
+            reason = self._pick_reason(model, chosen, entry.winner)
         else:
-            # Every non-hot provider is input-capped. The winner is preferred when
+            # Every usable provider is input-capped. The winner is preferred when
             # it is among them (a small request may still fit under the cap).
-            chosen = entry.winner if entry.winner in not_hot else not_hot[0]
+            chosen = entry.winner if entry.winner in usable else usable[0]
             reason = INPUT_CAP
         decision = Decision(chosen, reason, self._decision_region(model, rule, chosen, entry))
         return self._with_provider_only(deployments, chosen), decision
+
+    def _pick_reason(self, model: str, chosen: str, winner: str | None) -> str:
+        """Why the walk landed on `chosen` rather than the cached winner: `winner` when it
+        is the winner itself, `provider_broken` when the cached winner is currently marked
+        broken, and `safe_set` otherwise.
+
+        The broken case is called out because it is the one skip cause an operator has to
+        act on - a cooldown expires and a region verdict is a policy, whereas a provider
+        stays broken until someone fixes or unblocks it. It states the winner's recorded
+        state, not a causal claim: a winner that is also 429-hot is reported here too,
+        since naming it is still the actionable fact and the log is read by someone
+        deciding what to do next."""
+        if chosen == winner:
+            return WINNER
+        if winner is not None and self._cooldown.is_broken(model, winner):
+            return PROVIDER_BROKEN
+        return SAFE_SET
 
     def _region_allows(self, model: str, rule: Rule, slug: str, entry: CacheEntry | None) -> bool:
         """Whether a cold-start fallback slug may be pinned under the region policy.
@@ -554,26 +631,37 @@ class OpenRouterParetoCallback(CustomLogger):
         deployments: list[dict[str, object]],
         entry: CacheEntry | None = None,
     ) -> tuple[list[dict[str, object]], Decision]:
-        # Cold start (no winner): walk the operator-vetted fallback list. On 429
-        # keep trying until a fallback is not on cooldown. Input cap is a soft
-        # preference, matched to the warm path: prefer a non-capped fallback, and
-        # only fall back to a capped one (better to try than to fail - a small
+        # Cold start (no winner): walk the operator-vetted fallback list. On 429, or
+        # when a fallback is known-broken, keep trying until one is neither. Input cap
+        # is a soft preference, matched to the warm path: prefer a non-capped fallback,
+        # and only fall back to a capped one (better to try than to fail - a small
         # request may fit under the cap) when every eligible fallback is capped.
         # Region eligibility is checked first: a region-ineligible fallback is
         # unusable, so it does not count toward the all-hot diagnosis (an
         # ineligible non-hot provider must not mask every eligible provider being
-        # 429-hot). Only an all-429-hot ELIGIBLE fallback list is a hard stop.
+        # 429-hot). Only an eligible fallback list with no usable member is a hard stop,
+        # whether the members are 429-hot or known-broken.
         allowlist = self._allowlist()
         any_allowlist_disallowed = False
+        any_rule_excluded = False
+        any_broken = False
         eligible: list[str] = []
         any_eligible = False
         for slug in rule.cold_start_fallback:
             if not self._allowlist_allows(slug, allowlist):
                 any_allowlist_disallowed = True
                 continue
+            if self._provider_excluded(rule, slug):
+                any_rule_excluded = True
+                continue
             if not self._region_allows(model, rule, slug, entry):
                 continue
             any_eligible = True
+            # Same hard/soft split as the warm path: 429 and broken are hard skips, input
+            # cap is handled below as a preference so a capped fallback is still tried.
+            if self._cooldown.is_broken(model, slug):
+                any_broken = True
+                continue
             if self._cooldown.is_hot(model, slug):
                 continue
             eligible.append(slug)
@@ -585,11 +673,14 @@ class OpenRouterParetoCallback(CustomLogger):
             return self._with_provider_only(deployments, chosen), decision
         if any_eligible:
             # At least one fallback was region-eligible and every one of them was
-            # 429-hot (none made it into `eligible`).
+            # unusable (429-hot or known-broken); none made it into `eligible`.
             self._log_decision(model, rule, "wildcard", Decision(None, ALL_HOT, None))
+            why = "on a 429 cooldown"
+            if any_broken:
+                why += " or marked broken by a 400 pattern"
             raise AllProvidersOnCooldown(
                 f"openrouter-pareto: every region-eligible cold-start fallback for "
-                f"{model} is on a 429 cooldown; declining to route until one "
+                f"{model} is {why}; declining to route until one "
                 f"clears. fallback={rule.cold_start_fallback}"
             )
         # No fallback was region-eligible (or none is configured). Under
@@ -599,9 +690,12 @@ class OpenRouterParetoCallback(CustomLogger):
         # and the precision/context filters.
         if rule.exclude_regions and rule.unverified_region_policy == "unpinned":
             return self._unpinned_result(deployments), Decision(None, UNPINNED, None)
-        detail = "region-ineligible or none configured"
+        blockers: list[str] = []
         if any_allowlist_disallowed:
-            detail = "allowlist-disallowed, region-ineligible, or none configured"
+            blockers.append("allowlist-disallowed")
+        if any_rule_excluded:
+            blockers.append("excluded by exclude_providers")
+        detail = ", ".join([*blockers, "region-ineligible"]) + ", or none configured"
         self._warn_once(
             f"all-hot:{model}",
             f"openrouter-pareto: no usable cold-start fallback for {model} "
@@ -721,7 +815,7 @@ class OpenRouterParetoCallback(CustomLogger):
                     for d in deployments
                     if self.slugs_of(d)
                     and set(self.slugs_of(d)) <= trusted
-                    and self._usable_slugs(model, self.slugs_of(d))
+                    and self._usable_slugs(model, rule, self.slugs_of(d))
                 ]
                 if vetted:
                     return _Routable(vetted)
@@ -773,11 +867,15 @@ class OpenRouterParetoCallback(CustomLogger):
             return rule.allow_unknown_region
         return all(self._region_allows(model, rule, slug, entry) for slug in slugs)
 
-    def _usable_slugs(self, model: str, slugs: tuple[str, ...]) -> bool:
-        """Whether every slug a deployment authorizes is off cooldown. Pinned mode has
-        to apply the same usability test as wildcard mode, or switching routing modes
-        silently drops the 429 and input-cap mitigations."""
-        return bool(slugs) and all(not self._cooldown.is_skipped(model, s) for s in slugs)
+    def _usable_slugs(self, model: str, rule: Rule, slugs: tuple[str, ...]) -> bool:
+        """Whether every slug a deployment authorizes is off cooldown and outside the
+        rule's blocklist. Pinned mode has to apply the same usability test as wildcard
+        mode, or switching routing modes silently drops the 429, input-cap, and
+        exclude_providers mitigations."""
+        return bool(slugs) and all(
+            not self._cooldown.is_skipped(model, s) and not self._provider_excluded(rule, s)
+            for s in slugs
+        )
 
     def _narrow(
         self,
@@ -804,11 +902,13 @@ class OpenRouterParetoCallback(CustomLogger):
         for slug in self._preferred_slugs(model, rule, entry):
             match = [d for d in allowed if slug in self.slugs_of(d)]
             if match:
-                reason = WINNER if slug == entry.winner else SAFE_SET
+                reason = self._pick_reason(model, slug, entry.winner)
                 decision = Decision(slug, reason, self._decision_region(model, rule, slug, entry))
                 return self._pin_winner(match, slug), decision
         allowlist = self._allowlist()
-        if self._allowlist_allows(entry.winner, allowlist):
+        if self._allowlist_allows(entry.winner, allowlist) and not self._provider_excluded(
+            rule, entry.winner
+        ):
             winner_match = [d for d in allowed if entry.winner in self.slugs_of(d)]
             if winner_match:
                 # The preferred walk found no deployment for any preferred slug, yet the
@@ -845,11 +945,17 @@ class OpenRouterParetoCallback(CustomLogger):
         slug: str | None,
         rule: Rule | None,
     ) -> None:
-        """Log the failure (if the rule wants it) and record the cooldown hit.
+        """Log the failure (if the rule wants it) and record what the failure tells us
+        about the provider.
 
-        Shared by the two failure hooks so they cannot drift on what counts as
-        a 429 vs an input cap, or on the error-line shape. Returns without
-        recording when the provider slug is unresolvable."""
+        Shared by the two failure hooks so they cannot drift on what counts as a 429, an
+        input cap, or a provider misconfiguration, or on the error-line shape. Returns
+        without recording when the provider slug is unresolvable.
+
+        The 400 checks read the error body, because the status alone cannot separate the
+        two conditions a 400 can mean here. Input cap is tested first: it describes a
+        condition the request caused and is a bounded soft skip, so when a body matches
+        both it must not be promoted to a hard broken-provider exclusion."""
         if isinstance(status, int) and status >= 400 and rule is not None and rule.log_errors:
             trimmed = message[:1000]
             or_error_log(f"model={model} slug={slug} status={status} body={trimmed}")
@@ -861,8 +967,10 @@ class OpenRouterParetoCallback(CustomLogger):
             return
         if status == 429:
             self._cooldown.record(model, slug)
-        elif is_input_cap_error(status, message):
+        elif matches_400(_input_cap_patterns(rule), status, message):
             self._cooldown.record_input_cap(model, slug)
+        elif rule is not None and matches_400(rule.broken_provider_patterns, status, message):
+            self._cooldown.record_broken(model, slug, rule.broken_provider_ttl_s)
 
     async def async_log_failure_event(
         self,

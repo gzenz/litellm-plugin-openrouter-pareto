@@ -112,6 +112,21 @@ def _base_slug(slug: str) -> str:
     return slug.split("/", 1)[0]
 
 
+def provider_excluded(slug: str, excluded: tuple[str, ...]) -> bool:
+    """Whether an operator blocklist names this provider.
+
+    An entry matches either the full slug (`novita/fp8`, one endpoint) or the org base
+    (`novita`, every endpoint of that org), so both granularities are available without
+    inventing a syntax to tell them apart: an entry naming an org is an org, an entry
+    naming an endpoint is that endpoint. Comparison is case-insensitive because the rule
+    side is folded on load and an OR slug that ever arrived capitalized should still be
+    excluded by the operator's lowercase entry."""
+    if not excluded:
+        return False
+    lowered = slug.lower()
+    return lowered in excluded or _base_slug(lowered) in excluded
+
+
 def _norm_loc(value: str | None) -> str | None:
     """A provider_info location normalized for comparison, or None when absent. Compared
     verbatim against the operator's normalized `exclude_regions`; the plugin does not
@@ -194,6 +209,7 @@ def _stage1(
             _to_candidate(e, rule, uptime_by_tag)
             for e in stats
             if _base_slug(e.provider_slug) not in excluded_bases
+            and not provider_excluded(e.provider_slug, rule.exclude_providers)
             and (
                 allowed_providers is None
                 or _base_slug(e.provider_slug) in allowed_providers

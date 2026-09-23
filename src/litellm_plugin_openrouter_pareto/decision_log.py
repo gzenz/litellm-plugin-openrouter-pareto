@@ -22,6 +22,14 @@ from datetime import datetime, timezone
 WINNER = "winner"
 SAFE_SET = "safe_set"
 INPUT_CAP = "input_cap"
+# The cached winner is currently marked broken (a 400 body matched one of the rule's
+# `broken_provider_patterns`), so the walk moved past it. Unlike most reasons this
+# describes the provider that was REJECTED rather than the one chosen, and it states that
+# provider's recorded state rather than a causal claim - a winner that is also 429-hot is
+# reported here too. It is called out separately from `safe_set` because it is the one
+# skip cause an operator has to act on: a cooldown expires and a region verdict is a
+# policy, whereas a broken provider stays broken.
+PROVIDER_BROKEN = "provider_broken"
 COLD_START = "cold_start"
 ALL_HOT = "all_hot"
 UNPINNED = "unpinned"
